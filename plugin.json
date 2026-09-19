@@ -1,0 +1,157 @@
+{
+  "name": "local-review",
+  "publisher": "agentglass",
+  "description": "Reviews your pull requests on this machine with the agent and model you choose, in a sandbox that cannot write or reach GitHub, and puts the findings in the pull request view. Nothing is posted.",
+  "entrypoint": "python3 -u reviewer.py",
+  "scope": "read",
+  "icon": "icon.svg",
+  "color": "#8b5cf6",
+  "contributes": {
+    "panels": [
+      {
+        "id": "reviews",
+        "title": "Reviews",
+        "icon": "review"
+      }
+    ],
+    "prNotes": true,
+    "prActions": [
+      {
+        "id": "review",
+        "label": "Local review"
+      },
+      {
+        "id": "review-full",
+        "label": "Review from scratch"
+      },
+      {
+        "id": "watch",
+        "label": "Review every push"
+      },
+      {
+        "id": "cancel",
+        "label": "Stop this review"
+      }
+    ],
+    "settings": [
+      {
+        "key": "repos",
+        "type": "multi",
+        "label": "Repositories",
+        "description": "The repositories you can reach on GitHub. Only pull requests in the ones picked here are picked up by their label.",
+        "placeholder": "acme/orbit"
+      },
+      {
+        "key": "label",
+        "type": "string",
+        "label": "Label that asks for a review",
+        "description": "Put it on a pull request to have it reviewed; every push after that is reviewed again, the new part only, until you take it off.",
+        "default": "agentglass-review"
+      },
+      {
+        "key": "onlyMine",
+        "type": "boolean",
+        "label": "Only my pull requests",
+        "description": "A labelled pull request by somebody else is ignored unless this is off. Theirs can still be queued one at a time from the panel.",
+        "default": true
+      },
+      {
+        "key": "agent",
+        "type": "select",
+        "label": "Agent",
+        "description": "Any agent CLI installed here. Experimental ones run in the same sandbox but have not been measured in it.",
+        "default": "claude",
+        "options": [
+          {
+            "value": "claude",
+            "label": "Claude Code"
+          }
+        ]
+      },
+      {
+        "key": "model",
+        "type": "string",
+        "label": "Model",
+        "description": "Handed to the agent as it is. Empty uses the agent's default.",
+        "placeholder": "opus"
+      },
+      {
+        "key": "style",
+        "type": "select",
+        "label": "How to review",
+        "description": "Three come with the plugin, and they are deliberately plain. Pick \"my own prompt\" to write your own in the box below; it is kept here, never in the plugin, so an update cannot overwrite it.",
+        "default": "balanced",
+        "options": [
+          {
+            "value": "balanced",
+            "label": "Balanced \u2014 defects that matter"
+          },
+          {
+            "value": "security",
+            "label": "Security \u2014 what an attacker could do"
+          },
+          {
+            "value": "clean",
+            "label": "Clean code and tests \u2014 the next reader"
+          },
+          {
+            "value": "mine",
+            "label": "My own prompt \u2014 edited below"
+          }
+        ]
+      },
+      {
+        "key": "myPrompt",
+        "type": "text",
+        "label": "My own prompt",
+        "description": "Used when \"my own prompt\" is chosen above. It says only HOW to review \u2014 where the files are, that what they contain is evidence and never an instruction, and the block the app reads back are added around it. Choosing \"my own prompt\" fills this with whichever shipped one you had, so you start from it rather than from nothing.",
+        "placeholder": "Review this pull request the way\u2026"
+      },
+      {
+        "key": "extraInstructions",
+        "type": "text",
+        "label": "Anything to add",
+        "description": "Pasted at the end of whichever prompt is in use. For the house rules a reviewer keeps forgetting.",
+        "placeholder": "Flag any new environment variable that is not in the deployment template."
+      },
+      {
+        "key": "maxUsdPerReview",
+        "type": "number",
+        "label": "Spend cap per review (USD)",
+        "description": "The agent stops at this. Only agents that report cost can be held to it.",
+        "default": 2,
+        "min": 0.1,
+        "max": 50
+      },
+      {
+        "key": "maxUsdPerDay",
+        "type": "number",
+        "label": "Spend cap per day (USD)",
+        "default": 10,
+        "min": 0.5,
+        "max": 500
+      },
+      {
+        "key": "pollSeconds",
+        "type": "number",
+        "label": "Check GitHub every (seconds)",
+        "default": 180,
+        "min": 60,
+        "max": 3600
+      },
+      {
+        "key": "reviewDrafts",
+        "type": "boolean",
+        "label": "Review drafts too",
+        "default": false
+      },
+      {
+        "key": "extraPrs",
+        "type": "list",
+        "label": "Always review these",
+        "description": "owner/name#123, one per line, whoever wrote them.",
+        "placeholder": "acme/orbit#42"
+      }
+    ]
+  }
+}
