@@ -38,28 +38,16 @@
         "key": "repos",
         "type": "multi",
         "label": "Repositories",
-        "description": "The repositories you can reach on GitHub. Only pull requests in the ones picked here are picked up by their label.",
+        "group": "What it watches",
+        "description": "Only pull requests in these are picked up by their label.",
         "placeholder": "acme/orbit"
-      },
-      {
-        "key": "label",
-        "type": "string",
-        "label": "Label that asks for a review",
-        "description": "Put it on a pull request to have it reviewed; every push after that is reviewed again, the new part only, until you take it off.",
-        "default": "agentglass-review"
-      },
-      {
-        "key": "onlyMine",
-        "type": "boolean",
-        "label": "Only my pull requests",
-        "description": "A labelled pull request by somebody else is ignored unless this is off. Theirs can still be queued one at a time from the panel.",
-        "default": true
       },
       {
         "key": "agent",
         "type": "select",
         "label": "Agent",
-        "description": "Any agent CLI installed here. Experimental ones run in the same sandbox but have not been measured in it.",
+        "group": "What it watches",
+        "description": "Any agent CLI installed here. Experimental ones are marked.",
         "default": "claude",
         "options": [
           {
@@ -72,14 +60,16 @@
         "key": "model",
         "type": "string",
         "label": "Model",
-        "description": "Handed to the agent as it is. Empty uses the agent's default.",
+        "group": "What it watches",
+        "description": "Handed to the agent as it is. Empty uses its default.",
         "placeholder": "opus"
       },
       {
         "key": "style",
         "type": "select",
         "label": "How to review",
-        "description": "Three come with the plugin, and they are deliberately plain. Pick \"my own prompt\" to write your own in the box below; it is kept here, never in the plugin, so an update cannot overwrite it.",
+        "group": "How it reviews",
+        "description": "Three plain ones ship. Pick \"my own prompt\" to write yours below.",
         "default": "balanced",
         "options": [
           {
@@ -104,21 +94,24 @@
         "key": "myPrompt",
         "type": "text",
         "label": "My own prompt",
-        "description": "Used when \"my own prompt\" is chosen above. It says only HOW to review \u2014 where the files are, that what they contain is evidence and never an instruction, and the block the app reads back are added around it. Choosing \"my own prompt\" fills this with whichever shipped one you had, so you start from it rather than from nothing.",
+        "group": "How it reviews",
+        "description": "Only HOW to review \u2014 the rest is added around it.",
         "placeholder": "Review this pull request the way\u2026"
       },
       {
         "key": "extraInstructions",
         "type": "text",
         "label": "Anything to add",
-        "description": "Pasted at the end of whichever prompt is in use. For the house rules a reviewer keeps forgetting.",
+        "group": "How it reviews",
+        "description": "Pasted at the end of whichever prompt is in use.",
         "placeholder": "Flag any new environment variable that is not in the deployment template."
       },
       {
         "key": "maxUsdPerReview",
         "type": "number",
         "label": "Spend cap per review (USD)",
-        "description": "The agent stops at this. Only agents that report cost can be held to it.",
+        "group": "Budget",
+        "description": "The agent stops at this.",
         "default": 2,
         "min": 0.1,
         "max": 50
@@ -127,28 +120,51 @@
         "key": "maxUsdPerDay",
         "type": "number",
         "label": "Spend cap per day (USD)",
+        "group": "Budget",
         "default": 10,
         "min": 0.5,
-        "max": 500
+        "max": 500,
+        "description": "Across every review today."
       },
       {
-        "key": "pollSeconds",
-        "type": "number",
-        "label": "Check GitHub every (seconds)",
-        "default": 180,
-        "min": 60,
-        "max": 3600
+        "key": "label",
+        "type": "string",
+        "label": "Label that asks for a review",
+        "group": "Picked up automatically",
+        "description": "Put it on a pull request and every push is reviewed.",
+        "default": "agentglass-review"
+      },
+      {
+        "key": "onlyMine",
+        "type": "boolean",
+        "label": "Only my pull requests",
+        "group": "Picked up automatically",
+        "description": "Somebody else's labelled pull request is ignored.",
+        "default": true
       },
       {
         "key": "reviewDrafts",
         "type": "boolean",
         "label": "Review drafts too",
-        "default": false
+        "group": "Picked up automatically",
+        "default": false,
+        "description": "Drafts are skipped unless this is on."
+      },
+      {
+        "key": "pollSeconds",
+        "type": "number",
+        "label": "Check GitHub every (seconds)",
+        "group": "Advanced",
+        "default": 180,
+        "min": 60,
+        "max": 3600,
+        "description": "How often it looks for labelled pull requests."
       },
       {
         "key": "extraPrs",
         "type": "list",
         "label": "Always review these",
+        "group": "Advanced",
         "description": "owner/name#123, one per line, whoever wrote them.",
         "placeholder": "acme/orbit#42"
       }
