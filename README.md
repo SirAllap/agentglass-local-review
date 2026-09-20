@@ -2,10 +2,13 @@
 
 An [agentglass](https://github.com/SirAllap/agentglass) plugin that reviews your pull requests on your own machine, with the agent and model you choose, and puts what it finds inside the pull request in agentglass. Nothing is posted to GitHub.
 
-- **Asked for with a label.** Put `agentglass-review` on one of your pull requests in a watched repository. It is reviewed, and after that every push is reviewed again, the new part only, until you take the label off. Somebody else's pull request is reviewed only when you queue it yourself.
+- **A button in the pull request.** Open any pull request in agentglass and press **Local review** in its header. The button is the state of the review, not a trigger that forgets: *Queued*, *Reviewing · 1:12*, then what it found. Its caret holds the rest — review it from scratch, review every push from now on, stop the one running, and the settings.
+- **Or a label.** Put `agentglass-review` on one of your pull requests in a watched repository and it is reviewed on every push, the new part only, until you take the label off. Somebody else's is reviewed only when you ask for it — the button works on anybody's.
+- **A list of what it has read.** The *Reviews* panel in the Plugins view is Now, ready-and-not-opened-yet, and earlier. Every row opens its pull request on the local lane.
 - **Read where you already read.** Each review is one entry in the pull request's conversation, in a *Local* lane. Each finding sits under its line in the Files tab, marked local. You resolve or dismiss findings there, and the next review is told what you decided.
 - **Any installed agent.** Claude Code is measured. Codex, Gemini and OpenCode run in the same sandbox and are marked experimental until they have been measured in it.
 - **Caps.** One spend cap per review and one per day, and one review at a time.
+- **The prompt is yours.** Three plain ones ship — defects, security, the next reader — and "my own prompt" is a box in the settings. What you write there is kept with your settings, never in this repository, so an update cannot overwrite it and a prompt written for the code you are paid to work on never travels with a public plugin.
 
 ## How it stays local
 
