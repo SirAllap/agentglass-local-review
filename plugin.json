@@ -4,6 +4,23 @@
   "description": "Reviews your pull requests on this machine with the agent and model you choose, in a sandbox that cannot write or reach GitHub, and puts the findings in the pull request view. Nothing is posted.",
   "entrypoint": "python3 -u reviewer.py",
   "scope": "read",
+  "sandbox": {
+    "network": "internet",
+    "read": [
+      "~/.local/share/agentglass-local-review",
+      "~/.config/gh",
+      "~/.claude",
+      "~/.codex",
+      "~/.gemini",
+      "~/.config/opencode",
+      "~/.local/share/opencode",
+      "~/.config/mise",
+      "~/.local/share/mise",
+      "~/.bun",
+      "~/.npm-global"
+    ],
+    "programs": ["gh", "claude", "codex", "gemini", "opencode"]
+  },
   "icon": "icon.svg",
   "color": "#8b5cf6",
   "contributes": {

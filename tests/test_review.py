@@ -305,3 +305,39 @@ class WhichPrompt(unittest.TestCase):
             text = f.read_text().lower()
             for word in ("unsupported", "unverified", "nicetohave", "claims"):
                 self.assertNotIn(word, text, f"{f.name} carries {word}")
+
+
+class BoxMigration(unittest.TestCase):
+    """The folder moved when the plugin went into a box."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old, self.new = Path(self.tmp) / "old", Path(self.tmp) / "new"
+        self.old.mkdir()
+        (self.old / "state.json").write_text('{"watch": ["acme/orbit#1"]}')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_state_is_carried_over_once(self):
+        import reviewer
+        reviewer.migrate_state(self.old, self.new)
+        self.assertEqual((self.new / "state.json").read_text(), '{"watch": ["acme/orbit#1"]}')
+
+    def test_state_already_there_is_kept(self):
+        import reviewer
+        self.new.mkdir()
+        (self.new / "state.json").write_text("{}")
+        reviewer.migrate_state(self.old, self.new)
+        self.assertEqual((self.new / "state.json").read_text(), "{}")
+
+    def test_no_old_folder_is_not_an_error(self):
+        import reviewer
+        reviewer.migrate_state(self.old / "gone", self.new)
+        self.assertFalse((self.new / "state.json").exists())
+
+    def test_it_declares_the_internet_it_needs_and_no_write(self):
+        box = json.loads((HERE / "plugin.json").read_text())["sandbox"]
+        self.assertEqual(box["network"], "internet")
+        self.assertNotIn("write", box)
+        self.assertIn("~/.config/gh", box["read"])

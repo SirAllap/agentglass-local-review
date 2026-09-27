@@ -32,7 +32,11 @@ import review
 
 BASE = os.environ.get("AGENTGLASS_URL", "http://127.0.0.1:4000").rstrip("/")
 TOKEN = os.environ.get("AGENTGLASS_READ_TOKEN", "")
-DATA = Path(os.environ.get("HOME", str(Path.home()))) / ".local" / "share" / "agentglass-local-review"
+# In a box HOME is empty and the plugin's own folder, handed over as
+# AGENTGLASS_PLUGIN_DATA, is the only place that survives. A host that does not
+# box the plugin does not set it and keeps the folder this plugin always used.
+OLD_DATA = Path(os.environ.get("HOME", str(Path.home()))) / ".local" / "share" / "agentglass-local-review"
+DATA = Path(os.environ.get("AGENTGLASS_PLUGIN_DATA") or OLD_DATA)
 STATE = DATA / "state.json"
 PANEL = "reviews"
 
@@ -63,7 +67,21 @@ def log(*a: object) -> None:
 
 # --------------------------------------------------------------- state
 
+def migrate_state(old: Path, new: Path) -> None:
+    """Carry the review state over from the folder this plugin used before it
+    ran in a box, once and only if there is none here yet. The box lists the old
+    folder as a read-only grant; anywhere else `old == new` and this is a no-op."""
+    if old == new or (new / "state.json").exists():
+        return
+    try:
+        new.mkdir(parents=True, exist_ok=True)
+        (new / "state.json").write_bytes((old / "state.json").read_bytes())
+    except OSError:
+        pass
+
+
 def load_state() -> dict:
+    migrate_state(OLD_DATA, DATA)
     try:
         return json.loads(STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
