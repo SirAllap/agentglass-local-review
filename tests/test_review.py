@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -174,6 +175,20 @@ class CageShape(unittest.TestCase):
     def test_the_cage_holds_on_this_machine(self):
         r = cage.self_test()
         self.assertTrue(r["ok"], r)
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is not installed")
+    def test_a_host_pid_the_cage_happens_to_share_is_not_mistaken_for_a_leak(self):
+        # The cage's own pid namespace commonly numbers its first process 2
+        # (bash execs after an init pid 1). A probe that shells out to
+        # `kill -0 <host pid>` and gets handed that same small number by
+        # coincidence would see its own bash answer for the host and read
+        # "host process visible" — a false failure, not a leak. Forcing
+        # os.getpid() to 2 reproduces exactly that coincidence; the fixed
+        # probe does not read os.getpid() at all, so this must stay green
+        # regardless of which pid the test process happens to hold.
+        with unittest.mock.patch("os.getpid", return_value=2):
+            r = cage.self_test()
+        self.assertTrue(r["checks"].get("host processes are out of reach"), r)
 
 
 if __name__ == "__main__":

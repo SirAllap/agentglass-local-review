@@ -345,6 +345,13 @@ def build(adapter: Adapter, snapshot: Path, extra_ro: list[Path], out_dir: Path,
     return Cage(snapshot=snapshot, out_dir=out_dir, config_dir=config_dir, argv=args + argv, env=dict(os.environ))
 
 
+# The probe script forks at most a handful of short-lived processes (bash
+# itself, `touch`, `gh`, `ls`, one `python3`). A real host's /proc holds its
+# whole process table — dozens at the barest minimum, usually hundreds — so
+# this stays well clear of both without depending on any one pid's value.
+MAX_CAGE_PROCS = 16
+
+
 def self_test(agentglass_url: str | None = None, adapter: Adapter | None = None) -> dict[str, object]:
     """The cage, checked on this machine: what an agent would find if it
     tried. No model is called; cheap enough to run on every start.
@@ -368,7 +375,15 @@ def self_test(agentglass_url: str | None = None, adapter: Adapter | None = None)
             "touch \"$HOME/.agx-cage-probe\" 2>/dev/null; "
             "g=no; command -v gh >/dev/null && gh auth status >/dev/null 2>&1 && g=yes; "
             "s=$(ls -A \"$HOME/.ssh\" 2>/dev/null | wc -l); "
-            f"k=no; kill -0 {os.getpid()} 2>/dev/null && k=yes; "
+            # A pid probe (kill -0 <host pid>) is not reliable: --proc gives
+            # this cage its own pid namespace, so its own small pids (bash is
+            # commonly pid 2) can coincidentally equal the host pid we probe
+            # for and pass by accident. Instead count what /proc shows: a
+            # fresh pid-namespace /proc holds only this cage's own tasks
+            # (bash plus whatever it forked, a handful), while a leaked host
+            # /proc holds the host's whole process table (dozens to
+            # thousands). The count, not one pid's identity, is the signal.
+            f"k=$(ls /proc 2>/dev/null | grep -c '^[0-9][0-9]*$'); "
             "e=no; [ -n \"$AGX_CANARY\" ] && e=yes; "
             "o=no; touch OUT/ok 2>/dev/null && o=yes; "
             + (f"a=$(python3 -c 'import urllib.request,sys\ntry:\n urllib.request.urlopen(\"{url}/plugins\",timeout=3);print(200)\n"
@@ -384,7 +399,7 @@ def self_test(agentglass_url: str | None = None, adapter: Adapter | None = None)
         parts = r.stdout.split()
         if len(parts) != 7:
             return {"ok": False, "why": f"bwrap could not start a cage here: {r.stderr.strip()[:200]}", "checks": {}}
-        wrote_snap, gh_in, ssh_n, saw_host, env_leak, wrote_out, api = parts
+        wrote_snap, gh_in, ssh_n, proc_count, env_leak, wrote_out, api = parts
         leak = HOME / ".agx-cage-probe"
         home_leak = leak.exists()
         if home_leak:
@@ -394,7 +409,7 @@ def self_test(agentglass_url: str | None = None, adapter: Adapter | None = None)
             "nothing written to HOME survives": not home_leak,
             "GitHub CLI has no login inside": gh_in == "no",
             "no SSH keys inside": ssh_n == "0",
-            "host processes are out of reach": saw_host == "no",
+            "host processes are out of reach": int(proc_count) <= MAX_CAGE_PROCS,
             "the environment is an allowlist": env_leak == "no",
             "only the output directory is writable": wrote_out == "yes",
         }
