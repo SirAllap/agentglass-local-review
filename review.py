@@ -66,6 +66,9 @@ class Outcome:
     app's copy of it) did not answer. Such a failure says nothing about the
     pull request, so the plugin tries the same head again."""
     transport: bool = False
+    """How many bytes of context and prompt the agent was handed. The cost of
+    the next review is estimated from what this one cost per byte."""
+    input_bytes: int = 0
 
 
 def parse_answer(text: str) -> Outcome:
@@ -118,6 +121,36 @@ def style_text(style: str, mine: str) -> tuple[str, str | None]:
 
 def shipped(name: str) -> str:
     return (SHIPPED / f"{name}.md").read_text(encoding="utf-8")
+
+
+PRIOR_USD_PER_KB = 0.0075  # a first guess: about $0.30 for a 40 KB pull request, the middle of the first real runs
+
+
+@dataclass
+class Estimate:
+    low: float
+    mid: float
+    high: float
+    basis: str  # "history" or "default"
+
+    def text(self) -> str:
+        return f"${self.low:.2f}\u2013${self.high:.2f}" + (" (rough: no earlier review to learn from)" if self.basis == "default" else "")
+
+
+def estimate(input_bytes: int, past: list[tuple[float, int]], cap: float) -> Estimate:
+    """What a review reading `input_bytes` will cost: the median cost per KB of
+    earlier reviews by the same agent, times this size, from half to double.
+    The agent explores the repository on its own, so size is a rough guide, not
+    a price; the range says so, and the top never passes the cap, which the
+    agent itself is held to. `past` is (cost, bytes) of earlier reviews."""
+    rates = sorted(c / (b / 1024) for c, b in past if c > 0 and b > 0)
+    if rates:
+        rate, basis = rates[len(rates) // 2], "history"
+    else:
+        rate, basis = PRIOR_USD_PER_KB, "default"
+    mid = max(0.01, rate * input_bytes / 1024)
+    high = min(cap, mid * 2)
+    return Estimate(low=min(mid * 0.5, high), mid=min(mid, high), high=high, basis=basis)
 
 
 def decision_lines(decisions: dict) -> list[str]:
@@ -179,7 +212,7 @@ def build_prompt(files: dict[str, Path], incremental: bool, memory: list[str],
 
 def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_sha: str | None,
         memory: list[str], work_root: Path, on_proc=None, timeout_s: int = 1800,
-        style: str = "balanced", mine: str = "", extra: str = "") -> Outcome:
+        style: str = "balanced", mine: str = "", extra: str = "", gate=None) -> Outcome:
     """Gather everything outside the cage, run the agent inside it, read its
     answer. `on_proc` is handed the running process so the plugin can cancel."""
     started = time.time()
@@ -214,6 +247,12 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
         # must not run inside its review. See cage.py.
         cage.sanitize_snapshot(snap)
         prompt, prompt_problem = build_prompt(files, incremental, memory, style, mine, extra)
+        used = len(prompt.encode("utf-8")) + sum(p.stat().st_size for p in files.values())
+        if gate is not None:
+            # Asked before anything is spent: the reason to stop, or None.
+            stop = gate(used)
+            if stop:
+                return Outcome(ok=False, error=stop, seconds=time.time() - started, input_bytes=used)
         c = cage.build(adapter, snap, [ctx_dir], work / "out", work / "agent", prompt, model, cap_usd)
         # `errors="replace"`: an agent printing invalid UTF-8 must not raise
         # out of here with the process still running and Cancel lost.
@@ -242,6 +281,7 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
         out.cost_usd = cost if cost is not None else cap_usd
         out.seconds = time.time() - started
         out.prompt_problem = prompt_problem
+        out.input_bytes = used
         if not out.ok and proc.returncode != 0:
             tail = (stderr or stdout or "").strip().splitlines()[-1:] or [""]
             out.error = f"{adapter.label} exited with {proc.returncode}: {tail[0][:240]}"
