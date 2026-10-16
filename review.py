@@ -158,6 +158,50 @@ def estimate(input_bytes: int, past: list[tuple[float, int]], cap: float) -> Est
     return Estimate(low=min(mid * 0.5, high), mid=min(mid, high), high=high, basis=basis)
 
 
+@dataclass
+class Merged:
+    finding: Finding
+    """(passes that found it, passes run); None when only one pass ran."""
+    agreement: tuple[int, int] | None
+    by: list[str]
+
+
+def wants_second_opinion(findings: list[Finding]) -> bool:
+    return any(f.severity in ("critical", "high") for f in findings)
+
+
+def second_cap(first: float, cap: float, left: float) -> float | None:
+    """What the second pass may spend: never more than the first did (so a
+    review costs at most twice), than the per-review cap, or than is left of
+    the day. None when that is too little to run an agent."""
+    c = min(cap, first, left)
+    return c if c >= 0.05 else None
+
+
+def merge_passes(passes: list[tuple[str, list[Finding]]]) -> list[Merged]:
+    """One list out of several passes, joined by the finding's fingerprint (its
+    id). The worst severity any pass gave wins; the body is the first pass's.
+    The same agent run twice is told apart as "name #1", "name #2"."""
+    n = len(passes)
+    names = [a for a, _ in passes]
+    if len(set(names)) < n:
+        names = [f"{a} #{i + 1}" for i, a in enumerate(names)]
+    merged: dict[str, Merged] = {}
+    for i, (_, found) in enumerate(passes):
+        for f in found:
+            m = merged.get(f.id)
+            if m is None:
+                merged[f.id] = Merged(f, None, [names[i]])
+                continue
+            if names[i] not in m.by:
+                m.by.append(names[i])
+            if SEVERITIES.index(f.severity) < SEVERITIES.index(m.finding.severity):
+                m.finding = replace(m.finding, severity=f.severity)
+    for m in merged.values():
+        m.agreement = (len(m.by), n) if n > 1 else None
+    return list(merged.values())
+
+
 # The app lets a plugin answer 30 times an hour; this keeps a few in hand.
 REPLIES_PER_HOUR = 25
 

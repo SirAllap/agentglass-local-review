@@ -257,6 +257,29 @@ class Plugin:
             return f"Not reviewed: it would cost about {est.text()} and ${max(left, 0):.2f} is left today."
         return None
 
+    def other_agents(self, me: str) -> list[str]:
+        """Agents on this machine, signed in, other than `me`: a second
+        opinion from a different model is worth more than the same one twice."""
+        return [a.id for a in cage.installed_adapters() if a.id != me and a.verified and not cage.not_signed_in(a)]
+
+    def second_opinion(self, run_pass, agent_id: str, first: review.Outcome):
+        """One more pass over the same pull request, only when the first found
+        something critical or high and the day's budget has room for it.
+        Returns (merged findings or None, dollars the second pass spent)."""
+        if not review.wants_second_opinion(first.findings):
+            return None, 0.0
+        left = float(self.s("maxUsdPerDay", 10)) - self.spent_today()
+        cap = review.second_cap(first.cost_usd or 0.0, float(self.s("maxUsdPerReview", 2)), left)
+        if cap is None:
+            return None, 0.0
+        others = self.other_agents(agent_id)
+        second_id = others[0] if others else agent_id
+        second = run_pass(second_id, cap)
+        spent = second.cost_usd if second.cost_usd is not None else cap
+        if not second.ok:
+            return None, spent
+        return review.merge_passes([(agent_id, first.findings), (second_id, second.findings)]), spent
+
     def ask_gate(self, input_bytes: int, agent_id: str, via: str, approved: bool):
         """Asked after the budget gate: wait for the person's OK, or None to
         start. Never twice for the same run, and never on an app that cannot
@@ -489,12 +512,16 @@ class Plugin:
         # people's text, and it goes to the model only when asked for.
         with_context = pr.repo in [str(x) for x in self.s("contextRepos", [])]
 
-        out = review.run(pr, adapter, model, cap, None if job.full else prev.get("sha"), memory, DATA / "work",
-                         on_proc=hold, gate=gate,
-                         context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None, style=str(self.s("style", "balanced")),
-                         mine=str(self.s("myPrompt", "")),
-                         extra=review.focus_instruction(job.focus[0], self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(job.focus[1], {}))
-                         if job.focus else str(self.s("extraInstructions", "")))
+        def run_pass(adp: cage.Adapter, mdl: str, cap_usd: float, first: bool) -> review.Outcome:
+            return review.run(pr, adp, mdl, cap_usd, None if job.full else prev.get("sha"), memory, DATA / "work",
+                              on_proc=hold, gate=gate if first else None,
+                              context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None,
+                              style=str(self.s("style", "balanced")),
+                              mine=str(self.s("myPrompt", "")),
+                              extra=review.focus_instruction(job.focus[0], self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(job.focus[1], {}))
+                              if job.focus else str(self.s("extraInstructions", "")))
+
+        out = run_pass(adapter, model, cap, True)
         if out.needs_ok is not None:
             if self.hold_for_ok(job, run, out.needs_ok):
                 return
@@ -520,10 +547,19 @@ class Plugin:
                                                         **({"meta": f"${cost:.2f}"} if out.cost_usd is not None else {}),
                                                         "finishedAt": int(time.time() * 1000)})
             return
-        out.findings, suppressed = review.apply_decisions(out.findings, decisions)
+        merged, extra = self.second_opinion(
+            lambda aid, cap2: run_pass(cage.ADAPTERS[aid], model if aid == agent_id else "", cap2, False), agent_id, out)
+        if extra:
+            with self.lock:
+                self.state["spend"][date.today().isoformat()] = round(self.spent_today() + extra, 4)
+            cost += extra
+        marks = {m.finding.id: m for m in merged or []}
+        out.findings, suppressed = review.apply_decisions([m.finding for m in merged] if merged else out.findings, decisions)
         notes = [{"id": f.id, "runId": run_id, "repo": pr.repo, "number": pr.number, "sha": pr.head,
                   "severity": f.severity, "title": f.title, "body": f.body,
-                  **({"path": f.path} if f.path else {}), **({"line": f.line} if f.line else {})} for f in out.findings]
+                  **({"path": f.path} if f.path else {}), **({"line": f.line} if f.line else {}),
+                  **({"agreement": {"k": marks[f.id].agreement[0], "n": marks[f.id].agreement[1]}, "by": marks[f.id].by[:5]}
+                     if f.id in marks and marks[f.id].agreement else {})} for f in out.findings]
         if notes:
             r = call("POST", "/plugin/self/pr/notes", {"notes": notes})
             if not r.get("ok"):
@@ -531,6 +567,7 @@ class Plugin:
         meta = " · ".join(x for x in [f"${cost:.2f}" if out.cost_usd is not None else None, f"{int(out.seconds)} s",
                                         "since last review" if prev.get("sha") and not job.full else "whole pull request",
                                         f"{suppressed} dismissed earlier, not raised" if suppressed else None,
+                                        "second opinion" if merged else None,
                                         f"with {' and '.join(out.used_context)} context" if out.used_context else None] if x)
         summary = (f"*{out.intent}*\n\n" if out.intent else "") + out.summary
         call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta,
