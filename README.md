@@ -78,3 +78,7 @@ Needs `python3`, `gh` (logged in), `bwrap`, and at least one agent CLI. Then ope
 ```
 python3 -m unittest discover tests
 ```
+
+## Evals
+
+`evals/` holds small invented pull requests, each with a bug planted in it (and one with nothing wrong, to catch false alarms). `python3 evals/run.py --list` shows them; `python3 evals/run.py --agent claude --cap 0.5` reviews each with a real agent in the same cage and says how many planted bugs it found, how much noise it made and what it cost. It spends money, so it never runs in the tests; the tests only check that every case is well formed and that the scoring is right.

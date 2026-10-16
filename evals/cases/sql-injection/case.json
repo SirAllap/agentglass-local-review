@@ -1,0 +1,8 @@
+{
+  "title": "Build the user query as a string",
+  "body": "Easier to read and to log.",
+  "expect": [
+    {"id": "injection", "path": "orbit/users.py", "lines": [1, 4], "severity_min": "high",
+     "any": ["injection", "interpolat", "f-string", "parameteri", "placeholder"]}
+  ]
+}
