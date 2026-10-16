@@ -433,22 +433,9 @@ class Plugin:
             self.pr_error = err
         skipped: dict[str, str] = {}
         for pr in found.values():
-            done = self.state["reviewed"].get(pr.key, {})
-            if pr.draft and not self.s("reviewDrafts", False):
-                if pr.key in labelled:
-                    skipped[pr.key] = ("It is a draft. Turn on \u201cReview drafts too\u201d in this plugin's settings, "
-                                       "or mark the pull request ready.")
-                continue
-            if pr.key in labelled and self.is_mine(pr) is None:
-                # Whose it is is not known: listed, not reviewed on a guess.
-                skipped[pr.key] = self.me_error or "Cannot tell whether it is yours. Type your login in this plugin's settings."
-                continue
-            # A head the agent failed on is not retried on its own — at a
-            # model's price per attempt that is a bill every few minutes. A new
-            # push or a click tries again. One that never reached the agent
-            # (GitHub did not answer) is retried, with a wait and a limit.
-            if done.get("sha") != pr.head and (done.get("failed_sha") != pr.head or retry_due(done, pr.head, int(time.time() * 1000))):
-                self.enqueue(Job(pr=pr, why="new commits" if done else "label", via="label" if pr.key in labelled else "list"))
+            why = self.decide(pr, pr.key in labelled)
+            if why:
+                skipped[pr.key] = why
         self.tell_skipped(found, skipped)
 
     def waiting_run(self, key: str) -> tuple[str, dict] | None:
@@ -456,6 +443,79 @@ class Plugin:
             if f"{a['repo']}#{a['number']}" == key:
                 return rid, a
         return None
+
+    def decide(self, pr: github.Pr, labelled: bool) -> str | None:
+        """Review this pull request, hold it for an OK, or say why not: the
+        reason, only for a labelled one (a listed one is the person's own
+        business). Shared by the scan and the app's pr-changed event."""
+        done = self.state["reviewed"].get(pr.key, {})
+        if pr.draft and not self.s("reviewDrafts", False):
+            return ("It is a draft. Turn on \u201cReview drafts too\u201d in this plugin's settings, "
+                    "or mark the pull request ready.") if labelled else None
+        if labelled and self.is_mine(pr) is None:
+            # Whose it is is not known: listed, not reviewed on a guess.
+            return self.me_error or "Cannot tell whether it is yours. Type your login in this plugin's settings."
+        # A head the agent failed on is not retried on its own — at a
+        # model's price per attempt that is a bill every few minutes. A new
+        # push or a click tries again. One that never reached the agent
+        # (GitHub did not answer) is retried, with a wait and a limit.
+        if done.get("sha") != pr.head and (done.get("failed_sha") != pr.head or retry_due(done, pr.head, int(time.time() * 1000))):
+            self.enqueue(Job(pr=pr, why="new commits" if done else "label", via="label" if labelled else "list"))
+        return None
+
+    def pr_changed(self, ev: dict) -> None:
+        """The app saw this pull request's labels or head change. Look at that
+        one pull request now rather than at the next scan. An app that never
+        sends the event leaves the poll as it was."""
+        repo, number = ev.get("repo"), ev.get("number")
+        if not isinstance(repo, str) or not isinstance(number, int) or isinstance(number, bool):
+            return
+        if repo not in [r for r in self.s("repos", []) if github.REPO_RE.match(r)]:
+            return
+        key = f"{repo}#{number}"
+        label = str(self.s("label", "agentglass-review"))
+        labels = [x for x in (ev.get("labels") or []) if isinstance(x, str)]
+        if label not in labels:
+            self.take_back(key, "the label was removed")
+            return
+        try:
+            pr = github.view(repo, number)
+        except github.GhError as e:
+            with self.lock:
+                self.notice = f"Could not read {key}: {e}"
+            return
+        if self.s("onlyMine", True) and self.is_mine(pr) is False:
+            return
+        with self.lock:
+            self.prs[key] = pr
+        why = self.decide(pr, True)
+        with self.lock:
+            skipped = dict(self.skipped)
+        if why:
+            skipped[key] = why
+        else:
+            skipped.pop(key, None)
+        self.tell_skipped({key: pr}, skipped)
+
+    def take_back(self, key: str, why: str) -> None:
+        """Drop what is queued or waiting for an OK on this pull request. A
+        review already running is left to finish: its money is spent."""
+        with self.lock:
+            if key in self.queued:
+                self.queued.discard(key)
+                self.dropped.add(key)
+            held = self.waiting_run(key)
+            if held:
+                self.state["awaiting"].pop(held[0], None)
+                save_state(self.state)
+            had_reason = self.skipped.pop(key, None) is not None
+        if held:
+            rid, a = held
+            call("POST", "/plugin/self/pr/run", {"id": rid, "repo": a["repo"], "number": a["number"], "sha": a["head"],
+                                                   "title": "Review", "state": "cancelled", "summary": f"Cancelled: {why}.",
+                                                   "finishedAt": int(time.time() * 1000)})
+        if had_reason or held:
+            self.draw()
 
     def tell_skipped(self, found: dict[str, github.Pr], skipped: dict[str, str]) -> None:
         """Publish why, in the panel and, once per head and reason, on the pull
@@ -1059,6 +1119,8 @@ class Plugin:
             self.run_approve(ev)
         elif t == "run-skip":
             self.run_skip(ev)
+        elif t == "pr-changed":
+            self.pr_changed(ev)
         elif t == "pr-open":
             self.pr_seen(ev)
         elif t == "action":
