@@ -140,6 +140,15 @@ class Job:
     # id per stage would leave a queued run sitting there forever.
     run_id: str = ""
     title: str = "Review"
+    # (mode, finding id) for a Re-check or an Explain: one focused pass whose
+    # answer goes to that finding's thread and publishes no notes.
+    focus: tuple[str, str] | None = None
+    # Who started it: "label" (a labelled pull request found by a scan),
+    # "button" (pressed in the pull request's header) or "list" (a pull
+    # request named in the settings). Only the first two start unasked.
+    via: str = "list"
+    # The person said yes to its cost: it is not asked again.
+    approved: bool = False
 
     def run(self, **rest) -> dict:
         return {"id": self.run_id, "repo": self.pr.repo, "number": self.pr.number,
@@ -173,6 +182,14 @@ class Plugin:
         self.cage: dict = {"ok": False, "why": "not checked yet", "checks": {}}
         self.cage_for: str | None = None
         self.notice: str | None = None
+        # False once the app answers 404 to a thread reply: it is older than
+        # contract v2 and the plugin stops trying.
+        self.reply_supported = True
+        # A run held in "needs-ok" is kept in state["awaiting"] by run id, so
+        # a restart does not strand it. An app that refuses the state (one
+        # older than contract v2) is remembered and never asked again.
+        self.state.setdefault("awaiting", {})
+        self.ok_supported = True
 
     # ----------------------------------------------------------- settings
 
@@ -263,6 +280,33 @@ class Plugin:
             return None, spent
         return review.merge_passes([(agent_id, first.findings), (second_id, second.findings)]), spent
 
+    def ask_gate(self, input_bytes: int, agent_id: str, via: str, approved: bool):
+        """Asked after the budget gate: wait for the person's OK, or None to
+        start. Never twice for the same run, and never on an app that cannot
+        hold a run (it would wait for a button that is not drawn)."""
+        if approved or not self.ok_supported:
+            return None
+        est = self.estimate_for(input_bytes, agent_id)
+        threshold = review.ask_threshold(self.s("askAboveUsd"), float(self.s("maxUsdPerDay", 10)))
+        return review.NeedsOk(est) if review.must_ask(est.high, threshold, via) else None
+
+    def hold_for_ok(self, job: Job, run: dict, est: review.Estimate) -> bool:
+        """Publish the run as waiting for the person. False when the app does
+        not know the state: the caller then goes on as before contract v2."""
+        r = call("POST", "/plugin/self/pr/run", run | {
+            "state": "needs-ok", "costUsd": round(est.high, 4),
+            "summary": f"Estimated {est.text()}, over what runs without asking."})
+        if not r.get("ok"):
+            if r.get("status") == 400:
+                self.ok_supported = False
+                log("the app does not hold runs for an OK; going on without asking")
+            return False
+        with self.lock:
+            self.state["awaiting"][job.run_id] = {"repo": job.pr.repo, "number": job.pr.number, "head": job.pr.head,
+                                                  "full": job.full, "why": job.why, "via": job.via}
+            save_state(self.state)
+        return True
+
     def spent_today(self) -> float:
         return float(self.state["spend"].get(date.today().isoformat(), 0.0))
 
@@ -285,6 +329,7 @@ class Plugin:
         repos = [r for r in self.s("repos", []) if github.REPO_RE.match(r)]
         label = str(self.s("label", "agentglass-review"))
         found: dict[str, github.Pr] = {}
+        labelled: set[str] = set()
         err = None
         errors: list[str] = []
         # Each source on its own: one pull request that can no longer be read
@@ -302,6 +347,7 @@ class Plugin:
                     if self.s("onlyMine", True) and pr.author != self.me:
                         continue
                     found[pr.key] = pr
+                    labelled.add(pr.key)
             except github.GhError as e:
                 errors.append(f"{repo}: {e}")
         # Queued by hand before a restart: still listed, not reviewed again
@@ -339,10 +385,28 @@ class Plugin:
             # push or a click tries again. One that never reached the agent
             # (GitHub did not answer) is retried, with a wait and a limit.
             if done.get("sha") != pr.head and (done.get("failed_sha") != pr.head or retry_due(done, pr.head, int(time.time() * 1000))):
-                self.enqueue(Job(pr=pr, why="new commits" if done else "label"))
+                self.enqueue(Job(pr=pr, why="new commits" if done else "label", via="label" if pr.key in labelled else "list"))
+
+    def waiting_run(self, key: str) -> tuple[str, dict] | None:
+        for rid, a in self.state["awaiting"].items():
+            if f"{a['repo']}#{a['number']}" == key:
+                return rid, a
+        return None
 
     def enqueue(self, job: Job) -> None:
         with self.lock:
+            held = self.waiting_run(job.pr.key)
+            if held and not job.approved:
+                rid, a = held
+                if a["head"] == job.pr.head and not job.full:
+                    return  # that head already waits for the person's answer
+                # A newer push, or a press on the button: the question about
+                # the old run is moot, so it is taken back.
+                self.state["awaiting"].pop(rid, None)
+                save_state(self.state)
+                call("POST", "/plugin/self/pr/run", {"id": rid, "repo": a["repo"], "number": a["number"], "sha": a["head"],
+                                                       "title": "Review", "state": "cancelled",
+                                                       "summary": "replaced by a newer request", "finishedAt": int(time.time() * 1000)})
             if job.pr.key in self.queued or (self.current and self.current.pr.key == job.pr.key and self.current.pr.head == job.pr.head):
                 return
             self.queued.add(job.pr.key)
@@ -437,6 +501,9 @@ class Plugin:
             # refuse when even the low end does not fit in today's budget.
             why = self.budget_gate(n, agent_id)
             if why is None:
+                ask = self.ask_gate(n, agent_id, job.via, job.approved)
+                if ask:
+                    return ask
                 est = self.estimate_for(n, agent_id)
                 call("POST", "/plugin/self/pr/run", run | {"state": "running", "meta": f"Estimated {est.text()}"})
             return why
@@ -450,9 +517,18 @@ class Plugin:
                               on_proc=hold, gate=gate if first else None,
                               context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None,
                               style=str(self.s("style", "balanced")),
-                              mine=str(self.s("myPrompt", "")), extra=str(self.s("extraInstructions", "")))
+                              mine=str(self.s("myPrompt", "")),
+                              extra=review.focus_instruction(job.focus[0], self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(job.focus[1], {}))
+                              if job.focus else str(self.s("extraInstructions", "")))
 
         out = run_pass(adapter, model, cap, True)
+        if out.needs_ok is not None:
+            if self.hold_for_ok(job, run, out.needs_ok):
+                return
+            # An app older than contract v2 cannot hold the run: go on as
+            # that app always did, under the budget gate alone.
+            job.approved = True
+            return self.review(job)
         cost = out.cost_usd or 0.0
         with self.lock:
             day = date.today().isoformat()
@@ -465,6 +541,12 @@ class Plugin:
         if not out.ok:
             return fail(out.error or "the review failed", cost, transient=out.transport)
 
+        if job.focus:
+            self.finish_focus(pr, job.focus, out)
+            call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": "Answered in the finding's thread.",
+                                                        **({"meta": f"${cost:.2f}"} if out.cost_usd is not None else {}),
+                                                        "finishedAt": int(time.time() * 1000)})
+            return
         merged, extra = self.second_opinion(
             lambda aid, cap2: run_pass(cage.ADAPTERS[aid], model if aid == agent_id else "", cap2, False), agent_id, out)
         if extra:
@@ -492,8 +574,53 @@ class Plugin:
                                                     "finishedAt": int(time.time() * 1000)})
         self.remember(pr, run_id, out, None, cost, agent=agent_id)
         worst = [f for f in out.findings if f.severity in ("critical", "high")]
+        self.answer_threads(pr, {f.id for f in out.findings}, whole=job.full or not prev.get("sha"))
         notify(f"Review ready: {pr.key}",
                f"{len(out.findings)} findings" + (f", {len(worst)} critical or high" if worst else "") + " — open the pull request in agentglass")
+
+    def send_reply(self, fid: str, text: str) -> str:
+        """One answer in a finding's thread, within the app's hourly limit.
+        "ok" sent; "drop" the app no longer has that finding; "stop" try later
+        (the limit); "off" this app has no such route."""
+        if not self.reply_supported:
+            return "off"
+        now = int(time.time() * 1000)
+        with self.lock:
+            times = [t for t in self.state.get("replyTimes", []) if now - t < 3_600_000]
+        if review.replies_left(times, now) == 0:
+            return "stop"
+        r = call("POST", "/plugin/self/pr/notes/reply", {"id": fid, "text": text})
+        if r.get("ok"):
+            with self.lock:
+                self.state["replyTimes"] = times + [now]
+            return "ok"
+        if r.get("status") == 429:
+            return "stop"
+        if r.get("status") == 404 and not r.get("error"):
+            self.reply_supported = False
+            return "off"
+        return "drop"
+
+    def answer_threads(self, pr: github.Pr, found: set[str], whole: bool) -> None:
+        """After a review: answer each finding whose thread the person wrote in,
+        once, in the thread only. What the person is waiting on is in
+        entry["asked"]; a finding they closed meanwhile is not answered."""
+        with self.lock:
+            entry = self.state["reviewed"].get(pr.key, {})
+            asked = entry.get("asked", {})
+            closed = {c["id"] for c in entry.get("closed", [])}
+            ids = [i for i in asked if i not in closed]
+        for fid in list(asked):
+            if fid in closed:
+                asked.pop(fid, None)
+        for fid in ids:
+            status = self.send_reply(fid, review.thread_answer(fid in found, pr.head, whole))
+            if status in ("ok", "drop"):
+                asked.pop(fid, None)
+            elif status in ("stop", "off"):
+                break
+        with self.lock:
+            save_state(self.state)
 
     def remember(self, pr: github.Pr, run_id: str, out: review.Outcome | None, error: str | None, cost: float = 0.0,
                  transient: bool = False, agent: str = "") -> None:
@@ -522,7 +649,7 @@ class Plugin:
             if out is not None:
                 seen = entry.setdefault("notes", {})
                 for f in out.findings:
-                    seen[f.id] = {"title": f.title, "path": f.path}
+                    seen[f.id] = {"title": f.title, "path": f.path, "body": f.body[:600]}
                 if len(seen) > 500:
                     entry["notes"] = dict(list(seen.items())[-500:])
             self.state["history"] = ([{
@@ -576,7 +703,73 @@ class Plugin:
                 self.notice = f"{key} will be reviewed on every push."
             self.draw()
             return
-        self.enqueue(Job(pr=pr, full=(what == "review-full"), why="asked for"))
+        self.enqueue(Job(pr=pr, full=(what == "review-full"), why="asked for", via="button"))
+
+    def awaited(self, ev: dict) -> dict | None:
+        with self.lock:
+            a = self.state["awaiting"].pop(str(ev.get("id")), None)
+            if a is None or f"{a['repo']}#{a['number']}" != f"{ev.get('repo')}#{ev.get('number')}":
+                return None
+            save_state(self.state)
+            return a
+
+    def run_approve(self, ev: dict) -> None:
+        """The person said yes to a held run's cost. The same run goes on with
+        the same id, so the pull request's header carries on from "Needs your
+        OK" instead of starting a second line."""
+        a = self.awaited(ev)
+        if a is None:
+            return
+        try:
+            pr = github.view(a["repo"], int(a["number"]))
+        except github.GhError as e:
+            with self.lock:
+                self.notice = f"Could not read {a['repo']}#{a['number']}: {e}"
+            call("POST", "/plugin/self/pr/run", {"id": ev["id"], "repo": a["repo"], "number": a["number"], "sha": a["head"],
+                                                   "title": "Review", "state": "failed", "summary": self.notice,
+                                                   "finishedAt": int(time.time() * 1000)})
+            return
+        with self.lock:
+            self.prs[pr.key] = pr
+        self.enqueue(Job(pr=pr, full=bool(a.get("full")), why=a.get("why", "asked for"), via=a.get("via", "list"),
+                         run_id=str(ev["id"]), approved=True))
+
+    def run_skip(self, ev: dict) -> None:
+        """The person said no. This head is left alone until a new push or a
+        press of the button, like a review that failed in the agent."""
+        a = self.awaited(ev)
+        if a is None:
+            return
+        call("POST", "/plugin/self/pr/run", {"id": ev["id"], "repo": a["repo"], "number": a["number"], "sha": a["head"],
+                                               "title": "Review", "state": "cancelled", "summary": "skipped by you",
+                                               "finishedAt": int(time.time() * 1000)})
+        pr = self.prs.get(f"{a['repo']}#{a['number']}")
+        if pr is None:
+            pr = github.Pr(repo=a["repo"], number=int(a["number"]), title="", author="", head=a["head"], base_ref="", url="", draft=False)
+        self.remember(pr, str(ev["id"]), None, "skipped by you")
+
+    def note_action(self, ev: dict) -> None:
+        """Re-check or Explain pressed on one of this plugin's findings."""
+        mode = ev.get("id")
+        key = f"{ev.get('repo')}#{ev.get('number')}"
+        note = self.state["reviewed"].get(key, {}).get("notes", {}).get(ev.get("noteId"))
+        if mode not in ("recheck", "explain") or note is None:
+            return
+        try:
+            pr = github.view(ev["repo"], int(ev["number"]))
+        except github.GhError as e:
+            with self.lock:
+                self.notice = f"Could not read {key}: {e}"
+            return
+        with self.lock:
+            self.prs[key] = pr
+        self.enqueue(Job(pr=pr, full=True, why="asked for", via="button", focus=(mode, str(ev["noteId"])),
+                         title=("Re-check" if mode == "recheck" else "Explain") + f" · {note.get('title', '')[:60]}"))
+
+    def finish_focus(self, pr: github.Pr, focus: tuple[str, str], out: review.Outcome) -> None:
+        mode, fid = focus
+        note = self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(fid, {})
+        self.send_reply(fid, review.focus_answer(mode, out, note.get("title", ""), pr.head))
 
     def pr_seen(self, ev: dict) -> None:
         """The person opened this pull request in the app. What the last
@@ -602,6 +795,15 @@ class Plugin:
                 seen = entry.get("notes", {}).get(ev["id"], {})
                 closed.append({"id": ev["id"], "status": ev["status"], "title": seen.get("title", ev["id"]), "path": seen.get("path")})
             entry["closed"] = closed[-200:]
+            # A person's reply on an open finding is a question for the next
+            # review to answer; the plugin's own words are not.
+            asked = entry.setdefault("asked", {})
+            if ev["status"] != "open":
+                asked.pop(ev["id"], None)
+            elif (ev.get("reply") or {}).get("by") == "user":
+                asked[ev["id"]] = ev["reply"].get("at") or 0
+                while len(asked) > 200:
+                    asked.pop(next(iter(asked)))
             self.remember_decision(ev, entry)
             save_state(self.state)
 
@@ -759,6 +961,12 @@ class Plugin:
             self.note_status(ev)
         elif t == "pr-action":
             self.pr_action(ev)
+        elif t == "note-action":
+            self.note_action(ev)
+        elif t == "run-approve":
+            self.run_approve(ev)
+        elif t == "run-skip":
+            self.run_skip(ev)
         elif t == "pr-open":
             self.pr_seen(ev)
         elif t == "action":
