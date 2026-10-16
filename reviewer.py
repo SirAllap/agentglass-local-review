@@ -23,7 +23,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import cage
@@ -40,6 +40,7 @@ OLD_DATA = Path(os.environ.get("HOME", str(Path.home()))) / ".local" / "share" /
 DATA = Path(os.environ.get("AGENTGLASS_PLUGIN_DATA") or OLD_DATA)
 STATE = DATA / "state.json"
 PANEL = "reviews"
+PLUGIN_NAME = "local-review"
 
 # A review that failed to reach GitHub is tried again for the same head, a
 # little later each time, and then left alone: three tries cost nothing (the
@@ -173,6 +174,9 @@ class Plugin:
         self.cage: dict = {"ok": False, "why": "not checked yet", "checks": {}}
         self.cage_for: str | None = None
         self.notice: str | None = None
+        # (UTC day, dollars) as the app counts this plugin's runs, refreshed
+        # outside any lock; None until an app that keeps one has answered.
+        self.app_spend: tuple[str, float] | None = None
 
     # ----------------------------------------------------------- settings
 
@@ -240,7 +244,22 @@ class Plugin:
             return f"Not reviewed: it would cost about {est.text()} and ${max(left, 0):.2f} is left today."
         return None
 
+    def refresh_spend(self) -> None:
+        """Ask the app what it has summed for today. The app counts every run
+        that states a cost, once, whoever else spent on this machine's behalf;
+        an older app has no such route and the local count stays in use."""
+        r = call("GET", f"/plugins/pr-notes/cost?plugin={PLUGIN_NAME}&days=1")
+        if not r.get("ok") or not isinstance(r.get("days"), list):
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        usd = sum(float(d.get("usd") or 0) for d in r["days"] if d.get("day") == today)
+        with self.lock:
+            self.app_spend = (today, usd)
+
     def spent_today(self) -> float:
+        app = getattr(self, "app_spend", None)
+        if app and app[0] == datetime.now(timezone.utc).date().isoformat():
+            return app[1]
         return float(self.state["spend"].get(date.today().isoformat(), 0.0))
 
     # ----------------------------------------------------------- scanning
@@ -349,6 +368,8 @@ class Plugin:
                     self.draw()
                     continue
                 self.queued.discard(job.pr.key)
+            self.refresh_spend()
+            with self.lock:
                 cap_day = float(self.s("maxUsdPerDay", 10))
                 if self.spent_today() >= cap_day:
                     self.notice = f"Today's cap of ${cap_day:.2f} is spent — {job.pr.key} waits for tomorrow or a higher cap."
@@ -366,6 +387,7 @@ class Plugin:
             finally:
                 with self.lock:
                     self.current, self.proc = None, None
+                self.refresh_spend()
                 self.draw()
 
     def review(self, job: Job) -> None:
@@ -381,7 +403,8 @@ class Plugin:
 
         def fail(msg: str, cost: float = 0.0, transient: bool = False) -> None:
             call("POST", "/plugin/self/pr/run", run | {"state": "cancelled" if msg == "cancelled" else "failed",
-                                                        "summary": msg, "finishedAt": int(time.time() * 1000)})
+                                                        "summary": msg, "finishedAt": int(time.time() * 1000),
+                                                        **({"costUsd": round(cost, 4)} if cost else {})})
             self.remember(pr, run_id, None, msg, cost, transient=transient)
 
         if not self.cage.get("ok"):
@@ -451,7 +474,7 @@ class Plugin:
                                         f"{suppressed} dismissed earlier, not raised" if suppressed else None,
                                         f"with {' and '.join(out.used_context)} context" if out.used_context else None] if x)
         summary = (f"*{out.intent}*\n\n" if out.intent else "") + out.summary
-        call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta,
+        call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta, "costUsd": round(cost, 4),
                                                     "finishedAt": int(time.time() * 1000)})
         self.remember(pr, run_id, out, None, cost, agent=agent_id)
         worst = [f for f in out.findings if f.severity in ("critical", "high")]
