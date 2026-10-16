@@ -180,6 +180,10 @@ class Plugin:
         self.me: str | None = None
         # Why the login is unknown, in words that end with what to do.
         self.me_error: str | None = None
+        # key -> why a labelled pull request is not being reviewed. Rebuilt by
+        # every scan; shown in the panel, and told to the pull request once
+        # per head (state["told"]).
+        self.skipped: dict[str, str] = {}
         # The last failure to list repositories, so a login that stays broken
         # is logged once and not on every settings event.
         self.repos_error: str | None = None
@@ -427,24 +431,49 @@ class Plugin:
         with self.lock:
             self.prs = {**self.manual, **found} if err is None else {**self.prs, **self.manual, **found}
             self.pr_error = err
+        skipped: dict[str, str] = {}
         for pr in found.values():
             done = self.state["reviewed"].get(pr.key, {})
             if pr.draft and not self.s("reviewDrafts", False):
+                if pr.key in labelled:
+                    skipped[pr.key] = ("It is a draft. Turn on \u201cReview drafts too\u201d in this plugin's settings, "
+                                       "or mark the pull request ready.")
                 continue
             if pr.key in labelled and self.is_mine(pr) is None:
-                continue  # whose it is is not known: listed, not reviewed on a guess
+                # Whose it is is not known: listed, not reviewed on a guess.
+                skipped[pr.key] = self.me_error or "Cannot tell whether it is yours. Type your login in this plugin's settings."
+                continue
             # A head the agent failed on is not retried on its own — at a
             # model's price per attempt that is a bill every few minutes. A new
             # push or a click tries again. One that never reached the agent
             # (GitHub did not answer) is retried, with a wait and a limit.
             if done.get("sha") != pr.head and (done.get("failed_sha") != pr.head or retry_due(done, pr.head, int(time.time() * 1000))):
                 self.enqueue(Job(pr=pr, why="new commits" if done else "label", via="label" if pr.key in labelled else "list"))
+        self.tell_skipped(found, skipped)
 
     def waiting_run(self, key: str) -> tuple[str, dict] | None:
         for rid, a in self.state["awaiting"].items():
             if f"{a['repo']}#{a['number']}" == key:
                 return rid, a
         return None
+
+    def tell_skipped(self, found: dict[str, github.Pr], skipped: dict[str, str]) -> None:
+        """Publish why, in the panel and, once per head and reason, on the pull
+        request: a label that does nothing and says nothing reads as a bug."""
+        with self.lock:
+            self.skipped = skipped
+            told = self.state.setdefault("told", {})
+            for key in [k for k in told if k not in skipped]:
+                told.pop(key)
+            fresh = [(k, found[k], why) for k, why in skipped.items() if k in found and told.get(k) != f"{found[k].head}|{why}"]
+            for k, pr, why in fresh:
+                told[k] = f"{pr.head}|{why}"
+            if fresh:
+                save_state(self.state)
+        for k, pr, why in fresh:
+            call("POST", "/plugin/self/pr/run", {"id": f"skip-{pr.head[:10]}", "repo": pr.repo, "number": pr.number, "sha": pr.head,
+                                                 "title": "Review", "state": "cancelled", "summary": f"Not reviewed: {why}",
+                                                 "finishedAt": int(time.time() * 1000)})
 
     def enqueue(self, job: Job) -> None:
         with self.lock:
@@ -940,11 +969,16 @@ class Plugin:
                     children.append({"type": "row", "children": [
                         {"type": "badge", "text": "note" if tone == "warning" else "GitHub", "tone": tone},
                         {"type": "text", "size": "sm", "text": text}]})
-            if not (now or ready or earlier):
+            if not (now or ready or earlier or self.skipped):
                 children.append({"type": "empty", "title": "No reviews yet",
                                  "body": "Open a pull request and press **Local review** in its header. "
                                          f"Or put the `{self.s('label', 'agentglass-review')}` label on one of "
                                          "yours in a watched repository, and every push to it is reviewed."})
+            if self.skipped:
+                rows = [self.row(k, self.prs[k].title if k in self.prs else k, why,
+                                 [{"text": "not reviewed", "tone": "warning"}], "skip") for k, why in self.skipped.items()]
+                children.append({"type": "section", "title": "Labelled, not reviewed \u2014 and why",
+                                 "children": [{"type": "list", "items": rows, "empty": "Nothing."}]})
             for title, rows, empty in [("Now", now, None), ("Ready — not opened yet", ready, None), ("Earlier", earlier, None)]:
                 if not rows:
                     continue
