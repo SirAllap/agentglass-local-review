@@ -40,6 +40,21 @@ DATA = Path(os.environ.get("AGENTGLASS_PLUGIN_DATA") or OLD_DATA)
 STATE = DATA / "state.json"
 PANEL = "reviews"
 
+# A review that failed to reach GitHub is tried again for the same head, a
+# little later each time, and then left alone: three tries cost nothing (the
+# agent never ran) and a fourth would only repeat the third.
+RETRY_MAX = 3
+
+
+def retry_wait(tries: int) -> int:
+    """Seconds to wait after the `tries`-th transport failure: 5 min, then 15."""
+    return 300 * 3 ** (tries - 1)
+
+
+def retry_due(done: dict, head: str, now_ms: int) -> bool:
+    return (done.get("failed_sha") == head and 0 < done.get("tries", 0) < RETRY_MAX
+            and done.get("retry_at", 0) > 0 and now_ms >= done["retry_at"])
+
 
 def call(method: str, path: str, body: object | None = None, timeout: float = 40) -> dict:
     data = json.dumps(body).encode() if body is not None else None
@@ -273,10 +288,11 @@ class Plugin:
             done = self.state["reviewed"].get(pr.key, {})
             if pr.draft and not self.s("reviewDrafts", False):
                 continue
-            # A head that failed is not retried on its own — at a model's
-            # price per attempt that is a bill every few minutes. A new push
-            # or a click tries again.
-            if done.get("sha") != pr.head and done.get("failed_sha") != pr.head:
+            # A head the agent failed on is not retried on its own — at a
+            # model's price per attempt that is a bill every few minutes. A new
+            # push or a click tries again. One that never reached the agent
+            # (GitHub did not answer) is retried, with a wait and a limit.
+            if done.get("sha") != pr.head and (done.get("failed_sha") != pr.head or retry_due(done, pr.head, int(time.time() * 1000))):
                 self.enqueue(Job(pr=pr, why="new commits" if done else "label"))
 
     def enqueue(self, job: Job) -> None:
@@ -340,10 +356,10 @@ class Plugin:
         call("POST", "/plugin/self/pr/run", run)
         self.draw()
 
-        def fail(msg: str, cost: float = 0.0) -> None:
+        def fail(msg: str, cost: float = 0.0, transient: bool = False) -> None:
             call("POST", "/plugin/self/pr/run", run | {"state": "cancelled" if msg == "cancelled" else "failed",
                                                         "summary": msg, "finishedAt": int(time.time() * 1000)})
-            self.remember(pr, run_id, None, msg, cost)
+            self.remember(pr, run_id, None, msg, cost, transient=transient)
 
         if not self.cage.get("ok"):
             return fail(f"Not reviewed: the sandbox is not safe on this machine — {self.cage.get('why')}")
@@ -352,7 +368,7 @@ class Plugin:
 
         unreadable = github.cannot_read(pr.repo)
         if unreadable:
-            return fail(f"Not reviewed: {unreadable}")
+            return fail(f"Not reviewed: {unreadable}", transient=True)
         signed_out = cage.not_signed_in(adapter)
         if signed_out:
             return fail(f"Not reviewed: {signed_out}")
@@ -379,7 +395,7 @@ class Plugin:
             with self.lock:
                 self.notice = f"Reviewed with the shipped prompt: {out.prompt_problem}"
         if not out.ok:
-            return fail(out.error or "the review failed", cost)
+            return fail(out.error or "the review failed", cost, transient=out.transport)
 
         notes = [{"id": f.id, "runId": run_id, "repo": pr.repo, "number": pr.number, "sha": pr.head,
                   "severity": f.severity, "title": f.title, "body": f.body,
@@ -398,14 +414,26 @@ class Plugin:
         notify(f"Review ready: {pr.key}",
                f"{len(out.findings)} findings" + (f", {len(worst)} critical or high" if worst else "") + " — open the pull request in agentglass")
 
-    def remember(self, pr: github.Pr, run_id: str, out: review.Outcome | None, error: str | None, cost: float = 0.0) -> None:
+    def remember(self, pr: github.Pr, run_id: str, out: review.Outcome | None, error: str | None, cost: float = 0.0,
+                 transient: bool = False) -> None:
         with self.lock:
             entry = self.state["reviewed"].setdefault(pr.key, {})
             if out is not None:
                 entry["sha"] = pr.head
                 entry.pop("failed_sha", None)
             else:
+                tries = entry.get("tries", 0) + 1 if transient and entry.get("failed_sha") == pr.head else 1
                 entry["failed_sha"] = pr.head
+                entry.pop("retry_at", None)
+                if transient:
+                    entry["tries"] = tries
+                    if tries < RETRY_MAX:
+                        entry["retry_at"] = int(time.time() * 1000) + retry_wait(tries) * 1000
+                else:
+                    entry.pop("tries", None)
+            if out is not None:
+                entry.pop("tries", None)
+                entry.pop("retry_at", None)
             entry["at"] = int(time.time() * 1000)
             entry.setdefault("closed", [])
             # What each finding said, by id, so a status change can be told
