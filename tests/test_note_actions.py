@@ -66,7 +66,7 @@ class Plugin(unittest.TestCase):
         p = self.p = reviewer.Plugin.__new__(reviewer.Plugin)
         p.lock = threading.RLock()
         p.settings = {}
-        p.state = {"reviewed": {"acme/orbit#7": {"notes": {"f-1": NOTE}}}, "history": [], "spend": {}}
+        p.state = {"reviewed": {"acme/orbit#7": {"notes": {"f-1": NOTE}}}, "history": [], "spend": {}, "awaiting": {}}
         p.queue = reviewer.queue.Queue()
         p.queued, p.dropped, p.prs, p.manual = set(), set(), {}, {}
         p.current, p.notice, p.reply_supported = None, None, True

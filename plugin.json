@@ -152,6 +152,15 @@
         "description": "Across every review today."
       },
       {
+        "key": "askAboveUsd",
+        "type": "number",
+        "label": "Ask before a review that may cost more than (USD)",
+        "group": "Budget",
+        "description": "The label and the button start by themselves under this. Above it, or for a pull request from your list, the review waits for your OK in the pull request. Empty means a tenth of the day's cap.",
+        "min": 0,
+        "max": 500
+      },
+      {
         "key": "label",
         "type": "string",
         "label": "Label that asks for a review",
