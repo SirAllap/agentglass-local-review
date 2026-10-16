@@ -140,6 +140,10 @@ class Job:
     # id per stage would leave a queued run sitting there forever.
     run_id: str = ""
     title: str = "Review"
+    # (mode, finding id) for a Re-check or an Explain: one focused pass whose
+    # answer goes to that finding's thread and publishes no notes.
+    focus: tuple[str, str] | None = None
+    via: str = "button"
 
     def run(self, **rest) -> dict:
         return {"id": self.run_id, "repo": self.pr.repo, "number": self.pr.number,
@@ -428,7 +432,9 @@ class Plugin:
         out = review.run(pr, adapter, model, cap, None if job.full else prev.get("sha"), memory, DATA / "work",
                          on_proc=hold, gate=gate,
                          context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None, style=str(self.s("style", "balanced")),
-                         mine=str(self.s("myPrompt", "")), extra=str(self.s("extraInstructions", "")))
+                         mine=str(self.s("myPrompt", "")),
+                         extra=review.focus_instruction(job.focus[0], self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(job.focus[1], {}))
+                         if job.focus else str(self.s("extraInstructions", "")))
         cost = out.cost_usd or 0.0
         with self.lock:
             day = date.today().isoformat()
@@ -441,6 +447,12 @@ class Plugin:
         if not out.ok:
             return fail(out.error or "the review failed", cost, transient=out.transport)
 
+        if job.focus:
+            self.finish_focus(pr, job.focus, out)
+            call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": "Answered in the finding's thread.",
+                                                        **({"meta": f"${cost:.2f}"} if out.cost_usd is not None else {}),
+                                                        "finishedAt": int(time.time() * 1000)})
+            return
         out.findings, suppressed = review.apply_decisions(out.findings, decisions)
         notes = [{"id": f.id, "runId": run_id, "repo": pr.repo, "number": pr.number, "sha": pr.head,
                   "severity": f.severity, "title": f.title, "body": f.body,
@@ -462,6 +474,29 @@ class Plugin:
         notify(f"Review ready: {pr.key}",
                f"{len(out.findings)} findings" + (f", {len(worst)} critical or high" if worst else "") + " — open the pull request in agentglass")
 
+    def send_reply(self, fid: str, text: str) -> str:
+        """One answer in a finding's thread, within the app's hourly limit.
+        "ok" sent; "drop" the app no longer has that finding; "stop" try later
+        (the limit); "off" this app has no such route."""
+        if not self.reply_supported:
+            return "off"
+        now = int(time.time() * 1000)
+        with self.lock:
+            times = [t for t in self.state.get("replyTimes", []) if now - t < 3_600_000]
+        if review.replies_left(times, now) == 0:
+            return "stop"
+        r = call("POST", "/plugin/self/pr/notes/reply", {"id": fid, "text": text})
+        if r.get("ok"):
+            with self.lock:
+                self.state["replyTimes"] = times + [now]
+            return "ok"
+        if r.get("status") == 429:
+            return "stop"
+        if r.get("status") == 404 and not r.get("error"):
+            self.reply_supported = False
+            return "off"
+        return "drop"
+
     def answer_threads(self, pr: github.Pr, found: set[str], whole: bool) -> None:
         """After a review: answer each finding whose thread the person wrote in,
         once, in the thread only. What the person is waiting on is in
@@ -475,24 +510,11 @@ class Plugin:
             if fid in closed:
                 asked.pop(fid, None)
         for fid in ids:
-            if not self.reply_supported:
+            status = self.send_reply(fid, review.thread_answer(fid in found, pr.head, whole))
+            if status in ("ok", "drop"):
+                asked.pop(fid, None)
+            elif status in ("stop", "off"):
                 break
-            now = int(time.time() * 1000)
-            with self.lock:
-                times = [t for t in self.state.get("replyTimes", []) if now - t < 3_600_000]
-            if review.replies_left(times, now) == 0:
-                break
-            r = call("POST", "/plugin/self/pr/notes/reply", {"id": fid, "text": review.thread_answer(fid in found, pr.head, whole)})
-            if r.get("ok"):
-                with self.lock:
-                    self.state["replyTimes"] = times + [now]
-                    asked.pop(fid, None)
-            elif r.get("status") == 429:
-                break
-            elif r.get("status") == 404 and not r.get("error"):
-                self.reply_supported = False
-            else:
-                asked.pop(fid, None)  # a finding the app no longer has: nothing to answer
         with self.lock:
             save_state(self.state)
 
@@ -523,7 +545,7 @@ class Plugin:
             if out is not None:
                 seen = entry.setdefault("notes", {})
                 for f in out.findings:
-                    seen[f.id] = {"title": f.title, "path": f.path}
+                    seen[f.id] = {"title": f.title, "path": f.path, "body": f.body[:600]}
                 if len(seen) > 500:
                     entry["notes"] = dict(list(seen.items())[-500:])
             self.state["history"] = ([{
@@ -578,6 +600,29 @@ class Plugin:
             self.draw()
             return
         self.enqueue(Job(pr=pr, full=(what == "review-full"), why="asked for"))
+
+    def note_action(self, ev: dict) -> None:
+        """Re-check or Explain pressed on one of this plugin's findings."""
+        mode = ev.get("id")
+        key = f"{ev.get('repo')}#{ev.get('number')}"
+        note = self.state["reviewed"].get(key, {}).get("notes", {}).get(ev.get("noteId"))
+        if mode not in ("recheck", "explain") or note is None:
+            return
+        try:
+            pr = github.view(ev["repo"], int(ev["number"]))
+        except github.GhError as e:
+            with self.lock:
+                self.notice = f"Could not read {key}: {e}"
+            return
+        with self.lock:
+            self.prs[key] = pr
+        self.enqueue(Job(pr=pr, full=True, why="asked for", focus=(mode, str(ev["noteId"])),
+                         title=("Re-check" if mode == "recheck" else "Explain") + f" · {note.get('title', '')[:60]}"))
+
+    def finish_focus(self, pr: github.Pr, focus: tuple[str, str], out: review.Outcome) -> None:
+        mode, fid = focus
+        note = self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(fid, {})
+        self.send_reply(fid, review.focus_answer(mode, out, note.get("title", ""), pr.head))
 
     def pr_seen(self, ev: dict) -> None:
         """The person opened this pull request in the app. What the last
@@ -769,6 +814,8 @@ class Plugin:
             self.note_status(ev)
         elif t == "pr-action":
             self.pr_action(ev)
+        elif t == "note-action":
+            self.note_action(ev)
         elif t == "pr-open":
             self.pr_seen(ev)
         elif t == "action":
