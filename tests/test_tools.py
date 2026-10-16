@@ -86,12 +86,12 @@ class Find(Home):
 class Gh(Home):
     def test_gh_runs_the_binary_it_found_not_the_bare_name(self):
         exe = make_exe(self.home / ".local/bin/gh", "#!/bin/sh\necho gh-from-known-place\n")
-        self.assertEqual(github.run_gh(["x"]).strip(), "gh-from-known-place")
+        self.assertEqual(github.gh(["x"]).strip(), "gh-from-known-place")
         self.assertTrue(exe.exists())
 
     def test_gh_missing_names_where_it_looked(self):
         with self.assertRaises(github.GhError) as cm:
-            github.run_gh(["x"])
+            github.gh(["x"])
         self.assertIn("looked on PATH", str(cm.exception))
 
 
