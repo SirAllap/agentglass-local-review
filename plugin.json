@@ -197,10 +197,10 @@
         "type": "number",
         "label": "Check GitHub every (seconds)",
         "group": "Advanced",
-        "default": 180,
+        "default": 60,
         "min": 60,
         "max": 3600,
-        "description": "How often it looks for labelled pull requests."
+        "description": "How often it looks for labelled pull requests. Each look asks the app to refresh its list once, so a minute is about 60 GitHub list calls an hour per repository."
       },
       {
         "key": "extraPrs",

@@ -247,9 +247,35 @@ def _pr_from_detail(repo: str, det: dict) -> Pr | None:
               head=head, base_ref=str(det.get("baseRefName") or ""), url=str(det.get("url") or ""), draft=bool(det.get("isDraft")))
 
 
+FRESH_WAIT_S = 20
+
+
+def fresh_list(root: str, label: str, now=time.time, sleep=time.sleep) -> dict | None:
+    """The app's open pull requests carrying `label`, as of now.
+
+    The app answers a list from a cache and refreshes it behind the answer, so
+    the first answer to a scan is the list as of the scan before. A pull
+    request labelled a minute ago was missing from it until the scan after
+    that — measured as five minutes from label to review with a three-minute
+    poll. So the first ask forces a refresh, and the next ones wait (at most
+    FRESH_WAIT_S) for an answer fetched after the ask. An app that does not say
+    when it fetched is taken at its word."""
+    t0 = now()
+    d = app_get("/prs/list", {"root": root, "filter": "all", "state": "open", "label": label, "force": "1"})
+    while d is not None and "fetchedAt" in d and (d.get("loading") or float(d.get("fetchedAt") or 0) / 1000 < t0):
+        if now() - t0 >= FRESH_WAIT_S:
+            break
+        sleep(1)
+        again = app_get("/prs/list", {"root": root, "filter": "all", "state": "open", "label": label})
+        if again is None:
+            break
+        d = again
+    return d
+
+
 def labeled(repo: str, label: str) -> list[Pr]:
     root = app_root(repo)
-    d = app_get("/prs/list", {"root": root, "filter": "all", "state": "open", "label": label}) if root else None
+    d = fresh_list(root, label) if root else None
     if d is not None:
         out = []
         for row in d.get("prs") or []:
