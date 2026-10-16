@@ -78,6 +78,53 @@ class AppFirst(unittest.TestCase):
             self.assertEqual(github.viewer(), "orbit-dev")
 
 
+class NewRoutes(unittest.TestCase):
+    def setUp(self):
+        github._roots.clear()
+        self.addCleanup(github._roots.clear)
+
+    def test_the_head_is_the_apps_head_sha_even_when_commits_are_cut_short(self):
+        det = {**DETAIL, "headSha": "e" * 40, "baseSha": "f" * 40, "truncated": {"commits": 100}}
+        app = routes(**{"/prs/locate": {"ok": True, "root": "/work/orbit"}, "/prs/detail": {"ok": True, "detail": det}})
+        with mock.patch("github.app_get", app), mock.patch("github.gh", side_effect=AssertionError("gh called")):
+            self.assertEqual(github.view("acme/orbit", 7).head, "e" * 40)
+
+    def test_a_head_sha_that_is_not_40_hex_is_not_trusted(self):
+        det = {**DETAIL, "headSha": "main"}
+        app = routes(**{"/prs/locate": {"ok": True, "root": "/work/orbit"}, "/prs/detail": {"ok": True, "detail": det}})
+        with mock.patch("github.app_get", app):
+            self.assertEqual(github.view("acme/orbit", 7).head, HEAD)
+
+    def test_compare_asks_the_app_for_the_pull_requests_own_range(self):
+        seen = {}
+
+        def fake(path, params, timeout=60):
+            seen[path] = params
+            return {"ok": True, "root": "/work/orbit"} if path == "/prs/locate" else {"ok": True, "text": "range diff"}
+        with mock.patch("github.app_get", fake), mock.patch("github.gh", side_effect=AssertionError("gh called")):
+            self.assertEqual(github.compare("acme/orbit", "a" * 40, "b" * 40, 7), "range diff")
+        self.assertEqual(seen["/prs/compare-diff"], {"root": "/work/orbit", "number": "7", "from": "a" * 40, "to": "b" * 40})
+
+    def test_compare_falls_back_to_gh_and_to_none(self):
+        with mock.patch("github.app_get", routes()), mock.patch("github.gh", return_value="from gh") as g:
+            self.assertEqual(github.compare("acme/orbit", "a" * 40, "b" * 40, 7), "from gh")
+        self.assertIn("repos/acme/orbit/compare/%s...%s" % ("a" * 40, "b" * 40), g.call_args[0][0][-1])
+        with mock.patch("github.app_get", routes()), mock.patch("github.gh", side_effect=github.GhError("gone")):
+            self.assertIsNone(github.compare("acme/orbit", "a" * 40, "b" * 40, 7))
+
+    def test_labeled_sends_the_label_and_still_checks_it_for_an_older_app(self):
+        seen = {}
+        rows = [{"number": 7, "labels": [{"name": "agentglass-review"}]}, {"number": 8, "labels": [{"name": "wip"}]}]
+
+        def fake(path, params, timeout=60):
+            seen[path] = params
+            return {"/prs/locate": {"ok": True, "root": "/work/orbit"}, "/prs/list": {"ok": True, "prs": rows},
+                    "/prs/detail": {"ok": True, "detail": DETAIL}}[path]
+        with mock.patch("github.app_get", fake):
+            self.assertEqual([p.number for p in github.labeled("acme/orbit", "agentglass-review")], [7])
+        self.assertEqual(seen["/prs/list"]["label"], "agentglass-review")
+
+
 class SelfTest(unittest.TestCase):
     def setUp(self):
         github._roots.clear()

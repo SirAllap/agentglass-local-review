@@ -163,7 +163,7 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
         files["diff"].write_text(github.diff(pr.repo, pr.number), encoding="utf-8")
         incremental = False
         if prev_sha and prev_sha != pr.head:
-            delta = github.compare(pr.repo, prev_sha, pr.head)
+            delta = github.compare(pr.repo, prev_sha, pr.head, pr.number)
             if delta is not None:
                 files["delta"] = ctx_dir / "since-last-review.diff"
                 files["delta"].write_text(delta, encoding="utf-8")

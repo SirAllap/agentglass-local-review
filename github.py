@@ -133,8 +133,12 @@ def app_detail(repo: str, number: int) -> dict | None:
 
 
 def _app_head(det: dict) -> str | None:
-    """The head commit: the last of the pull request's commits, unless the
-    list was cut short, in which case the app does not know it."""
+    """The head commit: the app's own `headSha`, else the last of the pull
+    request's commits (an older app), unless that list was cut short, in
+    which case it is not known."""
+    sha = str(det.get("headSha") or "")
+    if re.fullmatch(r"[0-9a-f]{40}", sha):
+        return sha
     commits = det.get("commits") or []
     if commits and not (det.get("truncated") or {}).get("commits"):
         oid = str(commits[-1].get("oid") or "")
@@ -240,10 +244,13 @@ def _pr_from_detail(repo: str, det: dict) -> Pr | None:
 
 def labeled(repo: str, label: str) -> list[Pr]:
     root = app_root(repo)
-    d = app_get("/prs/list", {"root": root, "filter": "all", "state": "open"}) if root else None
+    d = app_get("/prs/list", {"root": root, "filter": "all", "state": "open", "label": label}) if root else None
     if d is not None:
         out = []
         for row in d.get("prs") or []:
+            # The app filters on `label` itself; an older build ignores the
+            # parameter and sends every open pull request, which would be
+            # reviewed, so the label is checked here as well.
             if label not in [str(x.get("name") or "") for x in row.get("labels") or []]:
                 continue
             pr = view(repo, int(row["number"]))
@@ -314,9 +321,14 @@ def diff(repo: str, number: int) -> str:
     return str(gh(["pr", "diff", str(number), "-R", repo], timeout=120))
 
 
-def compare(repo: str, base: str, head: str) -> str | None:
+def compare(repo: str, base: str, head: str, number: int | None = None) -> str | None:
     """What changed between two commits, or None when GitHub cannot say (a
-    force-push that dropped `base`). None means review the whole thing."""
+    force-push that dropped `base`). None means review the whole thing.
+    The app answers for a pull request it has a checkout of."""
+    root = app_root(repo) if number else None
+    d = app_get("/prs/compare-diff", {"root": root, "number": str(number), "from": base, "to": head}, 120) if root else None
+    if d and isinstance(d.get("text"), str):
+        return d["text"]
     try:
         return str(gh(["api", "-H", "Accept: application/vnd.github.diff", f"repos/{repo}/compare/{base}...{head}"], timeout=120))
     except GhError:
