@@ -157,7 +157,7 @@ class Plugin:
         and that the agent starts inside. Again whenever the agent changes."""
         agent = str(self.s("agent", "claude"))
         adapter = cage.ADAPTERS.get(agent)
-        result = with_github(cage.self_test(BASE, adapter), github.unreachable())
+        result = with_github(cage.self_test(BASE, adapter), github.unreachable([r for r in self.s("repos", []) if github.REPO_RE.match(r)]))
         with self.lock:
             self.cage, self.cage_for = result, agent
 
