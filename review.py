@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cage
@@ -120,6 +120,35 @@ def shipped(name: str) -> str:
     return (SHIPPED / f"{name}.md").read_text(encoding="utf-8")
 
 
+def decision_lines(decisions: dict) -> list[str]:
+    """What the person decided about findings in this repository, one line
+    each, the reason included: the next review reads these as evidence."""
+    out = []
+    for d in decisions.values():
+        reason = " ".join(str(d.get("reason") or "").split())[:500]
+        out.append(f"[{str(d.get('status', 'dismissed')).upper()}, repository-wide] {d.get('path') or '-'} — {d.get('title', '')}"
+                   + (f" — reason: {reason}" if reason else ""))
+    return out
+
+
+def apply_decisions(findings: list[Finding], decisions: dict) -> tuple[list[Finding], int]:
+    """Drop what the person already dismissed in this repository, matched by
+    the finding's stable id. A critical or high one stays — the code may still
+    have the problem — with the reason attached so the reader sees it was
+    handled before. Returns what is kept and how many were dropped."""
+    kept, dropped = [], 0
+    for f in findings:
+        d = decisions.get(f.id)
+        if d is None:
+            kept.append(f)
+        elif f.severity in ("critical", "high"):
+            note = f"Dismissed earlier in this repository: {' '.join(str(d.get('reason') or '').split())[:300]}"
+            kept.append(replace(f, body=(f.body + "\n\n" if f.body else "") + note))
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def build_prompt(files: dict[str, Path], incremental: bool, memory: list[str],
                  style: str = "balanced", mine: str = "", extra: str = "") -> tuple[str, str | None]:
     """The frame the plugin owns, wrapped around the style the person chose.
@@ -137,7 +166,7 @@ def build_prompt(files: dict[str, Path], incremental: bool, memory: list[str],
              f"when you need the surroundings.") if incremental else ""
     threads = f"- Earlier review threads, with their state: `{files['threads']}`" if "threads" in files else ""
     if memory:
-        rules = ("This pull request was reviewed before. What the person decided about those findings is in "
+        rules = ("What the person decided about earlier findings, on this pull request or elsewhere in this repository, with their reason when they gave one, is in "
                  f"`{files['memory']}`. Do not raise again anything they dismissed or resolved unless the code "
                  "still has the problem **and** it is critical or high; if so, say that it was marked handled. "
                  "Never suggest undoing something an earlier review thread asked for.")
