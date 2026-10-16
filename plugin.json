@@ -177,6 +177,14 @@
         "default": true
       },
       {
+        "key": "githubLogin",
+        "type": "string",
+        "label": "Your GitHub login",
+        "group": "Picked up automatically",
+        "description": "Only needed when the plugin cannot tell who you are (the app and gh both fail to say). Used to tell your pull requests from others'.",
+        "placeholder": "octocat"
+      },
+      {
         "key": "reviewDrafts",
         "type": "boolean",
         "label": "Review drafts too",
