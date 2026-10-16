@@ -5,13 +5,14 @@ login kept in the system keyring included), and its `/prs/*` read routes
 answer for any repository that has a checkout on this machine. The plugin's
 box cannot reach a keyring, so that is the only way a keyring-only login
 works. The second is `gh` in this process, which needs its token in a file.
-What the app does not offer yet (a commit-to-commit diff, the tarball at a
-commit, the list of reachable repositories) is read with `gh` alone.
+What the app does not offer (the list of reachable repositories) is read
+with `gh` alone.
 
-No local checkout is involved. The pull request's code comes from GitHub's
-tarball of the exact head commit, extracted into a scratch directory; its
-diff comes from GitHub's diff of the pull request. So a review never creates
-a worktree, a branch, a ref or an object in any repository on this machine,
+No worktree is ever created. The pull request's code is the exact head commit
+extracted into a scratch directory: from the app's `/prs/tree-at` when it has
+a checkout of the repository (read from git objects, nothing is checked out),
+else from GitHub's tarball through `gh`. So a review never creates a
+worktree, a branch, a ref or an object in any repository on this machine,
 which matters most for the repositories that belong to somebody else.
 
 Every command here is a read: `gh pr list`, `gh pr view`, `gh pr diff`,
@@ -340,8 +341,49 @@ MAX_EXTRACTED = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 300_000
 
 
-def snapshot(repo: str, sha: str, dest: Path) -> int:
-    """The repository at exactly `sha`, from GitHub's tarball, into `dest`.
+def app_tree(repo: str, sha: str, number: int | None, tmp: Path) -> bool:
+    """The commit's files from the app's own checkout of `repo`, as a tar written
+    to `tmp`. False, with `app_said` saying why, when the app has no checkout,
+    does not have the commit, is an older build without the route, or answers
+    with a tree of another commit. The caller then goes to `gh`."""
+    global app_said
+    root = app_root(repo)
+    if not root or not TOKEN:
+        return False
+    params = {"root": root, "sha": sha, **({"number": str(number)} if number else {})}
+    req = urllib.request.Request(f"{BASE}/prs/tree-at?{urllib.parse.urlencode(params)}", headers={"Authorization": f"Bearer {TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            if "x-tar" not in str(r.headers.get("content-type", "")):
+                try:
+                    app_said = f"/prs/tree-at: {json.loads(r.read() or b'{}').get('error') or 'no tree'}"[:200]
+                except ValueError:
+                    app_said = "/prs/tree-at did not send a tree"
+                return False
+            if r.headers.get("x-tree-sha") != sha:
+                app_said = "/prs/tree-at sent the tree of another commit"
+                return False
+            total = 0
+            with open(tmp, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    total += len(chunk)
+                    if total > MAX_TARBALL:
+                        app_said = f"the repository is over {MAX_TARBALL // (1024 * 1024)} MB at that commit"
+                        return False
+                    f.write(chunk)
+    except urllib.error.HTTPError as e:
+        app_said = f"/prs/tree-at answered {e.code}"
+        return False
+    except OSError as e:
+        app_said = f"/prs/tree-at did not answer ({str(e)[:80]})"
+        return False
+    return True
+
+
+def snapshot(repo: str, sha: str, dest: Path, number: int | None = None) -> int:
+    """The repository at exactly `sha`, into `dest`: from the app's checkout
+    when it has one (no GitHub request, so a private repository and a keyring
+    login both work), else from GitHub's tarball through `gh`.
     Returns how many entries were skipped as unsafe.
 
     Streamed to disk with a cap rather than read whole into memory, and
@@ -352,7 +394,16 @@ def snapshot(repo: str, sha: str, dest: Path) -> int:
     not fatal — a repository with an absolute symlink is still reviewable."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise GhError("not a commit sha")
-    tmp = dest.parent / (dest.name + ".tar.gz")
+    tmp = dest.parent / (dest.name + ".tar")
+    try:
+        if not app_tree(repo, sha, number, tmp):
+            _download(repo, sha, tmp)
+        return _extract(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _download(repo: str, sha: str, tmp: Path) -> None:
     try:
         with open(tmp, "wb") as f:
             proc = subprocess.Popen([_gh_path(), "api", f"repos/{repo}/tarball/{sha}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -370,29 +421,35 @@ def snapshot(repo: str, sha: str, dest: Path) -> int:
         raise GhError(str(e) if e.args and "looked" in str(e) else "the GitHub CLI (gh) is not installed") from e
     except subprocess.TimeoutExpired as e:
         raise GhError("downloading the tarball timed out") from e
+
+
+def _extract(tmp: Path, dest: Path) -> int:
     dest.mkdir(parents=True, exist_ok=True)
     skipped = 0
     try:
-        with tarfile.open(tmp, "r:gz") as tf:
+        with tarfile.open(tmp, "r:*") as tf:
             members = tf.getmembers()
             if len(members) > MAX_MEMBERS:
                 raise GhError(f"the repository has over {MAX_MEMBERS} files at that commit")
             if sum(m.size for m in members if m.isfile()) > MAX_EXTRACTED:
                 raise GhError(f"the repository is over {MAX_EXTRACTED // (1024 ** 3)} GB unpacked")
-            # GitHub wraps everything in one top directory named after the commit.
-            top = members[0].name.split("/", 1)[0] if members else ""
+            # GitHub wraps everything in one top directory named after the
+            # commit; the app's tar is rooted at "." and has none.
+            first = members[0].name if members else ""
+            top = "" if first.startswith("./") or first == "." else first.split("/", 1)[0]
             for m in members:
-                if not m.name.startswith(top + "/"):
+                name = m.name[2:] if m.name.startswith("./") else m.name
+                if top:
+                    if not name.startswith(top + "/"):
+                        continue
+                    name = name[len(top) + 1:]
+                if not name or name == ".":
                     continue
-                m.name = m.name[len(top) + 1:]
-                if not m.name:
-                    continue
+                m.name = name
                 try:
                     tf.extract(m, dest, filter="data")
                 except (tarfile.TarError, OSError):
                     skipped += 1
     except tarfile.TarError as e:
         raise GhError(f"the tarball could not be read: {e}") from e
-    finally:
-        tmp.unlink(missing_ok=True)
     return skipped
