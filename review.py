@@ -155,6 +155,27 @@ def estimate(input_bytes: int, past: list[tuple[float, int]], cap: float) -> Est
     return Estimate(low=min(mid * 0.5, high), mid=min(mid, high), high=high, basis=basis)
 
 
+# The app lets a plugin answer 30 times an hour; this keeps a few in hand.
+REPLIES_PER_HOUR = 25
+
+
+def thread_answer(still_there: bool, sha: str, whole: bool) -> str:
+    """What the plugin says in a finding's thread after a new push. Only a
+    review of the whole pull request can say a finding is fixed: one of just
+    the changes since the last review not finding it proves nothing about code
+    it did not read."""
+    head = f"Checked on {sha[:7]}: "
+    if still_there:
+        return head + "still there."
+    if whole:
+        return head + "fixed."
+    return head + "the changes since the last review do not raise it again."
+
+
+def replies_left(sent_ms: list[int], now_ms: int) -> int:
+    return max(0, REPLIES_PER_HOUR - sum(1 for t in sent_ms if now_ms - t < 3_600_000))
+
+
 def decision_lines(decisions: dict) -> list[str]:
     """What the person decided about findings in this repository, one line
     each, the reason included: the next review reads these as evidence."""
