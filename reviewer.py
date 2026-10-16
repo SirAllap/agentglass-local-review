@@ -217,6 +217,20 @@ class Plugin:
         v = self.settings.get(key)
         return default if v is None or v == "" else v
 
+    def estimate_for(self, input_bytes: int, agent_id: str) -> review.Estimate:
+        past = [(float(h.get("cost") or 0), int(h.get("bytes") or 0)) for h in self.state["history"]
+                if h.get("ok") and h.get("agent") == agent_id]
+        return review.estimate(input_bytes, past, float(self.s("maxUsdPerReview", 2)))
+
+    def budget_gate(self, input_bytes: int, agent_id: str) -> str | None:
+        """Called once the review is ready to start the agent. Says why not when
+        even the low end of the estimate is more than what is left today."""
+        est = self.estimate_for(input_bytes, agent_id)
+        left = float(self.s("maxUsdPerDay", 10)) - self.spent_today()
+        if est.low > left:
+            return f"Not reviewed: it would cost about {est.text()} and ${max(left, 0):.2f} is left today."
+        return None
+
     def spent_today(self) -> float:
         return float(self.state["spend"].get(date.today().isoformat(), 0.0))
 
@@ -382,8 +396,17 @@ class Plugin:
             with self.lock:
                 self.proc = p
 
+        def gate(n: int) -> str | None:
+            # Before the agent starts: say what it is expected to cost, and
+            # refuse when even the low end does not fit in today's budget.
+            why = self.budget_gate(n, agent_id)
+            if why is None:
+                est = self.estimate_for(n, agent_id)
+                call("POST", "/plugin/self/pr/run", run | {"state": "running", "meta": f"Estimated {est.text()}"})
+            return why
+
         out = review.run(pr, adapter, model, cap, None if job.full else prev.get("sha"), memory, DATA / "work",
-                         on_proc=hold, style=str(self.s("style", "balanced")),
+                         on_proc=hold, gate=gate, style=str(self.s("style", "balanced")),
                          mine=str(self.s("myPrompt", "")), extra=str(self.s("extraInstructions", "")))
         cost = out.cost_usd or 0.0
         with self.lock:
@@ -409,13 +432,13 @@ class Plugin:
         summary = (f"*{out.intent}*\n\n" if out.intent else "") + out.summary
         call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta,
                                                     "finishedAt": int(time.time() * 1000)})
-        self.remember(pr, run_id, out, None, cost)
+        self.remember(pr, run_id, out, None, cost, agent=agent_id)
         worst = [f for f in out.findings if f.severity in ("critical", "high")]
         notify(f"Review ready: {pr.key}",
                f"{len(out.findings)} findings" + (f", {len(worst)} critical or high" if worst else "") + " — open the pull request in agentglass")
 
     def remember(self, pr: github.Pr, run_id: str, out: review.Outcome | None, error: str | None, cost: float = 0.0,
-                 transient: bool = False) -> None:
+                 transient: bool = False, agent: str = "") -> None:
         with self.lock:
             entry = self.state["reviewed"].setdefault(pr.key, {})
             if out is not None:
@@ -447,6 +470,7 @@ class Plugin:
             self.state["history"] = ([{
                 "key": pr.key, "title": pr.title, "run": run_id, "sha": pr.head, "at": entry["at"],
                 "ok": out is not None, "error": error, "cost": cost,
+                "agent": agent, "bytes": out.input_bytes if out else 0,
                 "counts": {s: sum(1 for f in out.findings if f.severity == s) for s in review.SEVERITIES} if out else {},
             }] + self.state["history"])[:200]
             save_state(self.state)
