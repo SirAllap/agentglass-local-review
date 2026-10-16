@@ -1,0 +1,8 @@
+{
+  "title": "Count retries as total tries",
+  "body": "`retries` now means how many tries in all, so the loop runs `retries` times.",
+  "expect": [
+    {"id": "raise-none", "path": "orbit/upload.py", "lines": [9, 15], "severity_min": "medium",
+     "any": ["none", "retries=0", "zero", "no attempt", "never runs"]}
+  ]
+}

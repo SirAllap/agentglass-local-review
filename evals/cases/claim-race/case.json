@@ -1,0 +1,8 @@
+{
+  "title": "Check for the claim file before writing it",
+  "body": "Clearer than catching FileExistsError.",
+  "expect": [
+    {"id": "check-then-act", "path": "orbit/claims.py", "lines": [5, 9], "severity_min": "medium",
+     "any": ["race", "toctou", "atomic", "time-of-check", "two processes", "concurrent"]}
+  ]
+}

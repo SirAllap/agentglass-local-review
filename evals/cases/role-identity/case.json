@@ -1,0 +1,8 @@
+{
+  "title": "Tidy the delete check",
+  "body": "Use the identity operator for the role test.",
+  "expect": [
+    {"id": "is-string", "path": "orbit/access.py", "lines": [2, 2], "severity_min": "high",
+     "any": ["identity", " is ", "==", "interned", "string literal"]}
+  ]
+}
