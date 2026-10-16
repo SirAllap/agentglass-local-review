@@ -56,6 +56,22 @@ def gh_json(args: list[str], timeout: int = 60):
         raise GhError("gh returned something that is not JSON") from e
 
 
+FIX_LOGIN = "gh auth token | gh auth login -h github.com --with-token --insecure-storage"
+
+
+def unreachable() -> str | None:
+    """None when this process can read GitHub, else the sentence that says why
+    and what to type. Asked from the plugin's own process: a box has no
+    keyring, so a `gh` login that keeps its token there works in a terminal
+    and fails here."""
+    try:
+        gh(["api", "user"], timeout=20)
+    except GhError as e:
+        return (f"gh cannot reach GitHub from the plugin ({e}). The plugin runs in a box with no system keyring, "
+                f"so a login stored in the keyring does not reach it. Run once in a terminal: {FIX_LOGIN}")
+    return None
+
+
 def accessible_repos(limit: int = 2000) -> list[str]:
     """owner/name of every repository this login can reach, most recently
     pushed first."""

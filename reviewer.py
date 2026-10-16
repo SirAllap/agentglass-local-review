@@ -59,6 +59,16 @@ def call(method: str, path: str, body: object | None = None, timeout: float = 40
         return {"ok": False, "status": 0, "error": str(e)[:200]}
 
 
+def with_github(result: dict, why: str | None) -> dict:
+    """The cage result plus the one check the cage cannot make: that GitHub
+    answers this process. Without it the panel read "Sandbox holds" while
+    every GitHub call failed."""
+    checks = {**(result.get("checks") or {}), "GitHub is reachable from the plugin": why is None}
+    ok = bool(result.get("ok")) and why is None
+    reasons = [x for x in (result.get("why"), why) if x]
+    return {**result, "ok": ok, "checks": checks, "why": None if ok else " · ".join(reasons)}
+
+
 def log(*a: object) -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     with open(DATA / "plugin.log", "a", encoding="utf-8") as f:
@@ -147,7 +157,7 @@ class Plugin:
         and that the agent starts inside. Again whenever the agent changes."""
         agent = str(self.s("agent", "claude"))
         adapter = cage.ADAPTERS.get(agent)
-        result = cage.self_test(BASE, adapter)
+        result = with_github(cage.self_test(BASE, adapter), github.unreachable())
         with self.lock:
             self.cage, self.cage_for = result, agent
 
@@ -539,7 +549,7 @@ class Plugin:
                                  "children": [{"type": "list", "items": rows, "empty": empty or "Nothing."}]})
             checks = self.cage.get("checks") or {}
             children.append({"type": "text", "size": "sm", "tone": "muted",
-                             "text": f"Sandbox holds · {sum(1 for v in checks.values() if v)} of {len(checks)} checks · "
+                             "text": f"{'Sandbox holds' if self.cage.get('ok') else 'Check failed: ' + str(self.cage.get('why'))} · {sum(1 for v in checks.values() if v)} of {len(checks)} checks · "
                                      f"watching {len(self.prs)} pull {'request' if len(self.prs) == 1 else 'requests'}"})
             return {"type": "stack", "gap": "lg", "children": children}
 

@@ -367,3 +367,29 @@ class BoxMigration(unittest.TestCase):
         self.assertEqual(box["network"], "internet")
         self.assertNotIn("write", box)
         self.assertIn("~/.config/gh", box["read"])
+
+
+class GithubReachable(unittest.TestCase):
+    """The panel said "Sandbox holds" while every GitHub call failed: the token
+    of a `gh` login lives in the system keyring, and the box has no keyring."""
+
+    def test_a_working_login_is_reachable(self):
+        with unittest.mock.patch("github.gh", return_value='{"login": "orbit"}'):
+            self.assertIsNone(github.unreachable())
+
+    def test_a_missing_login_names_the_exact_fix(self):
+        err = github.GhError("Requires authentication (HTTP 401)")
+        with unittest.mock.patch("github.gh", side_effect=err):
+            why = github.unreachable()
+        self.assertIn("gh auth token | gh auth login -h github.com --with-token --insecure-storage", why)
+        self.assertIn("keyring", why)
+
+    def test_the_cage_result_fails_when_github_is_not_reachable(self):
+        import reviewer
+        base = {"ok": True, "checks": {"x": True}, "why": None}
+        out = reviewer.with_github(base, "gh has no token in the box")
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["checks"]["GitHub is reachable from the plugin"])
+        self.assertIn("gh has no token in the box", out["why"])
+        self.assertTrue(reviewer.with_github(base, None)["checks"]["GitHub is reachable from the plugin"])
+        self.assertTrue(base["ok"])  # the input is not changed
