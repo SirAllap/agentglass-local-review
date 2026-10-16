@@ -202,6 +202,16 @@
         "description": "owner/name#123, one per line, whoever wrote them.",
         "placeholder": "acme/orbit#42"
       }
+    ],
+    "noteActions": [
+      {
+        "id": "recheck",
+        "label": "Re-check"
+      },
+      {
+        "id": "explain",
+        "label": "Explain"
+      }
     ]
   }
 }
