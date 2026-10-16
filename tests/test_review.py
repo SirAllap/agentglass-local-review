@@ -234,6 +234,17 @@ class PanelRows(unittest.TestCase):
         self.assertEqual([r["id"] for r in earlier], ["acme/billing#17/r2"])
         self.assertEqual(ready[0]["badges"][0]["text"], "2 high")
 
+    def test_the_badge_names_each_severity_it_counts(self):
+        """One critical and one high used to read "2 high": the badge summed
+        the two and kept the weaker word, so the worst finding vanished."""
+        def badge(counts):
+            hist = [{"key": "acme/orbit#42", "title": "Retry", "run": "r1", "sha": "4a89ef5aa", "at": 200,
+                     "ok": True, "error": None, "cost": 0, "counts": counts}]
+            return self.plugin(hist, {}).sections()[1][0]["badges"][0]["text"]
+        self.assertEqual(badge({"critical": 1, "high": 1}), "1 critical, 1 high")
+        self.assertEqual(badge({"critical": 2}), "2 critical")
+        self.assertEqual(badge({"high": 3, "medium": 4}), "3 high")
+
     def test_a_review_running_or_waiting_is_under_now(self):
         import reviewer
         pr = github.Pr(repo="acme/orbit", number=42, title="Retry", author="me",

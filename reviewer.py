@@ -566,11 +566,11 @@ class Plugin:
         for h in self.state["history"][:40]:
             seen = self.state["reviewed"].get(h["key"], {}).get("seenAt", 0)
             counts = h.get("counts") or {}
-            worst = counts.get("critical", 0) + counts.get("high", 0)
+            worst = [f"{counts[k]} {k}" for k in ("critical", "high") if counts.get(k)]
             if not h["ok"]:
                 badges = [{"text": "failed", "tone": "danger"}]
             elif worst:
-                badges = [{"text": f"{worst} high", "tone": "danger"}]
+                badges = [{"text": ", ".join(worst), "tone": "danger"}]
             elif any(counts.values()):
                 badges = [{"text": f"{sum(counts.values())} to look at", "tone": "warning"}]
             else:
