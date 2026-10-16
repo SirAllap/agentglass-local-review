@@ -346,7 +346,7 @@ class Plugin:
 
         if not self.cage.get("ok"):
             return fail(f"Not reviewed: the sandbox is not safe on this machine — {self.cage.get('why')}")
-        if not adapter or not shutil.which(adapter.binary):
+        if not adapter or not cage.tools.which(adapter.binary):
             return fail(f"Not reviewed: the agent `{agent_id}` is not installed here.")
 
         prev = self.state["reviewed"].get(pr.key, {})

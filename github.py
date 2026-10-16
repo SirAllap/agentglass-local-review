@@ -24,6 +24,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import tools
+
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 PR_REF_RE = re.compile(r"^\s*([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})\s*#\s*(\d{1,9})\s*$")
 URL_RE = re.compile(r"^\s*https://github\.com/([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})/pull/(\d{1,9})\b")
@@ -39,11 +41,19 @@ def parse_pr_ref(text: str) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
+def _gh_path() -> str:
+    """`gh` by where it really is, not by the PATH the app happened to start with."""
+    found = tools.find("gh")
+    if not found.path:
+        raise FileNotFoundError(found.missing("the GitHub CLI (gh)"))
+    return found.path
+
+
 def run_gh(args: list[str], timeout: int = 60, binary: bool = False) -> str | bytes:
     try:
-        r = subprocess.run(["gh", *args], capture_output=True, timeout=timeout, text=not binary)
+        r = subprocess.run([_gh_path(), *args], capture_output=True, timeout=timeout, text=not binary)
     except FileNotFoundError as e:
-        raise GhError("the GitHub CLI (gh) is not installed") from e
+        raise GhError(str(e) if e.args and "looked" in str(e) else "the GitHub CLI (gh) is not installed") from e
     except subprocess.TimeoutExpired as e:
         raise GhError(f"gh {args[0]} timed out") from e
     if r.returncode != 0:
@@ -238,7 +248,7 @@ def _proxy_tarball(repo: str, sha: str, tmp: Path) -> bool:
 
 def _gh_tarball(repo: str, sha: str, tmp: Path) -> None:
     with open(tmp, "wb") as f:
-        proc = subprocess.Popen(["gh", "api", f"repos/{repo}/tarball/{sha}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen([_gh_path(), "api", f"repos/{repo}/tarball/{sha}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         total = 0
         assert proc.stdout is not None
         while chunk := proc.stdout.read(1 << 20):
@@ -268,7 +278,7 @@ def snapshot(repo: str, sha: str, dest: Path) -> int:
         if not _proxy_tarball(repo, sha, tmp):
             _gh_tarball(repo, sha, tmp)
     except FileNotFoundError as e:
-        raise GhError("the GitHub CLI (gh) is not installed") from e
+        raise GhError(str(e) if e.args and "looked" in str(e) else "the GitHub CLI (gh) is not installed") from e
     except subprocess.TimeoutExpired as e:
         raise GhError("downloading the tarball timed out") from e
     dest.mkdir(parents=True, exist_ok=True)

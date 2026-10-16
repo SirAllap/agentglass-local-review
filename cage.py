@@ -48,6 +48,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import tools
+
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 
 # Hidden from the agent: an empty tmpfs over each directory, /dev/null over
@@ -211,7 +213,7 @@ ADAPTERS: dict[str, Adapter] = {
 
 
 def installed_adapters() -> list[Adapter]:
-    return [a for a in ADAPTERS.values() if shutil.which(a.binary)]
+    return [a for a in ADAPTERS.values() if tools.which(a.binary)]
 
 
 def bwrap_path() -> str | None:
@@ -257,14 +259,11 @@ def runtime_mounts(adapter: Adapter, path: str | None = None) -> list[Path]:
             r = _home_root(Path(entry))
             if r and r.exists():
                 roots.add(r)
-    exe = shutil.which(adapter.binary)
+    exe = tools.which(adapter.binary)
     if exe:
         r = _home_root(Path(exe))
         if r and r.exists():
             roots.add(r)
-    mise = HOME / ".config" / "mise"
-    if mise.is_dir():
-        roots.add(mise.resolve())
     home = HOME.resolve()
     keep = []
     for r in sorted(roots):
@@ -342,6 +341,11 @@ def build(adapter: Adapter, snapshot: Path, extra_ro: list[Path], out_dir: Path,
     for k, v in env.items():
         args += ["--setenv", k, v]
     argv = [a.replace("OUT/", str(out_dir) + "/") for a in adapter.argv(prompt, model, cap_usd, [str(p) for p in extra_ro])]
+    # The real binary (symlinks followed, they are not mounted), by absolute path: the cage's PATH may not hold it, and a
+    # version manager's shim cannot work in an empty HOME.
+    exe = tools.which(adapter.binary)
+    if exe and argv and argv[0] == adapter.binary:
+        argv[0] = str(Path(exe).resolve())
     return Cage(snapshot=snapshot, out_dir=out_dir, config_dir=config_dir, argv=args + argv, env=dict(os.environ))
 
 
@@ -430,8 +434,9 @@ def agent_starts(adapter: Adapter) -> tuple[bool, str]:
     that needs more of HOME than its install fails here, before a review
     spends anything on it."""
     import subprocess
-    if not shutil.which(adapter.binary):
-        return False, f"{adapter.binary} is not installed"
+    found = tools.find(adapter.binary)
+    if not found.path:
+        return False, found.missing(adapter.binary)
     with tempfile.TemporaryDirectory(prefix="agx-cage-agent-") as t:
         snap = Path(t, "snap"); snap.mkdir()
         probe = Adapter(**{**adapter.__dict__, "argv": lambda p, m, c, d: [adapter.binary, "--version"]})
