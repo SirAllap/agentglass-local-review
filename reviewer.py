@@ -27,6 +27,7 @@ from datetime import date
 from pathlib import Path
 
 import cage
+import context
 import github
 import review
 
@@ -412,8 +413,13 @@ class Plugin:
                 call("POST", "/plugin/self/pr/run", run | {"state": "running", "meta": f"Estimated {est.text()}"})
             return why
 
+        # Off unless this repository was listed: a card and CI logs are other
+        # people's text, and it goes to the model only when asked for.
+        with_context = pr.repo in [str(x) for x in self.s("contextRepos", [])]
+
         out = review.run(pr, adapter, model, cap, None if job.full else prev.get("sha"), memory, DATA / "work",
-                         on_proc=hold, gate=gate, style=str(self.s("style", "balanced")),
+                         on_proc=hold, gate=gate,
+                         context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None, style=str(self.s("style", "balanced")),
                          mine=str(self.s("myPrompt", "")), extra=str(self.s("extraInstructions", "")))
         cost = out.cost_usd or 0.0
         with self.lock:
@@ -437,7 +443,8 @@ class Plugin:
                 log("notes refused", pr.key, r)
         meta = " · ".join(x for x in [f"${cost:.2f}" if out.cost_usd is not None else None, f"{int(out.seconds)} s",
                                         "since last review" if prev.get("sha") and not job.full else "whole pull request",
-                                        f"{suppressed} dismissed earlier, not raised" if suppressed else None] if x)
+                                        f"{suppressed} dismissed earlier, not raised" if suppressed else None,
+                                        f"with {' and '.join(out.used_context)} context" if out.used_context else None] if x)
         summary = (f"*{out.intent}*\n\n" if out.intent else "") + out.summary
         call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta,
                                                     "finishedAt": int(time.time() * 1000)})

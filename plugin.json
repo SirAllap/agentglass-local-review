@@ -60,6 +60,14 @@
         "placeholder": "acme/orbit"
       },
       {
+        "key": "contextRepos",
+        "type": "multi",
+        "label": "Send the card and CI results to the model for",
+        "group": "What it watches",
+        "description": "Off for every repository until you list it. For a listed one the review also reads the card named in the pull request (ClickUp or Jira) and what the app knows of its failing checks, telling apart a failure seen on main or flaky from one seen nowhere else. If either holds what looks like a secret, the review does not run.",
+        "placeholder": "acme/orbit"
+      },
+      {
         "key": "agent",
         "type": "select",
         "label": "Agent",
