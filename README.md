@@ -6,7 +6,7 @@ An [agentglass](https://github.com/SirAllap/agentglass) plugin that reviews your
 - **Or a label.** Put `agentglass-review` on one of your pull requests in a watched repository and it is reviewed on every push, the new part only, until you take the label off. Somebody else's is reviewed only when you ask for it — the button works on anybody's.
 - **A list of what it has read.** The *Reviews* panel in the Plugins view is Now, ready-and-not-opened-yet, and earlier. Every row opens its pull request on the local lane.
 - **A price before it runs.** Once the context is gathered and before the agent starts, the run shows an estimate ("Estimated $0.15–$0.60"), learned from what the same agent cost on your earlier reviews. If even the low end is more than what is left of today's budget, the review is not started and says so.
-- **Read where you already read.** Each review is one entry in the pull request's conversation, in a *Local* lane. Each finding sits under its line in the Files tab, marked local. You resolve or dismiss findings there, and the next review is told what you decided.
+- **Read where you already read.** Each review is one entry in the pull request's conversation, in a *Local* lane. Each finding sits under its line in the Files tab, marked local. You resolve or dismiss findings there, and the next review is told what you decided. Dismiss a finding with a reply that gives the reason and the same problem is not raised again anywhere in that repository (a critical or high one still comes back, marked as dismissed earlier).
 - **Any installed agent.** Claude Code is measured. Codex, Gemini and OpenCode run in the same sandbox and are marked experimental until they have been measured in it.
 - **Caps.** One spend cap per review and one per day, and one review at a time.
 - **The prompt is yours.** Three plain ones ship — defects, security, the next reader — and "my own prompt" is a box in the settings. What you write there is kept with your settings, never in this repository, so an update cannot overwrite it and a prompt written for the code you are paid to work on never travels with a public plugin.
@@ -20,7 +20,7 @@ Every agent runs in one [bubblewrap](https://github.com/containers/bubblewrap) s
 - The agent gets a throwaway config directory, so none of your hooks, MCP servers or settings run, and nothing it writes outlives the review.
 - One output directory is the only thing it can write.
 
-The plugin reads GitHub outside the sandbox, with your `gh` login, and only reads: the pull request's tarball at its head commit, its diff and its threads. It never checks out anything in your repositories.
+The plugin reads GitHub outside the sandbox, with your `gh` login, and only reads: the pull request's code at its head commit, its diff and its threads. It never checks out anything in your repositories.
 
 The plugin checks the sandbox when it starts and refuses to review if any of that does not hold. Measured with Claude given every permission of its own: it could not write a file, `gh` answered "not logged in", and `git` over SSH failed.
 
@@ -61,8 +61,9 @@ A repository to review must be one of these:
   keyring. Once, in a terminal: `gh auth token | gh auth login -h github.com --with-token --insecure-storage`
   (the token file is readable by you only).
 
-With neither, the review is skipped and says so. The head commit's code is
-always fetched with `gh`.
+With neither, the review is skipped and says so. The head commit's code comes
+from the app's checkout when it has one (and then `gh` is not needed at all);
+only a repository without a checkout is fetched with `gh`.
 
 ## Install
 

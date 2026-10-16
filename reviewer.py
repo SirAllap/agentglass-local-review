@@ -45,6 +45,9 @@ PANEL = "reviews"
 # agent never ran) and a fourth would only repeat the third.
 RETRY_MAX = 3
 
+# Findings dismissed with a reason, kept per repository. Oldest go first.
+DECISIONS_MAX = 300
+
 
 def retry_wait(tries: int) -> int:
     """Seconds to wait after the `tries`-th transport failure: 5 min, then 15."""
@@ -388,7 +391,11 @@ class Plugin:
             return fail(f"Not reviewed: {signed_out}")
 
         prev = self.state["reviewed"].get(pr.key, {})
-        memory = [] if job.full else [f"[{m['status'].upper()}] {m['path'] or '-'} — {m['title']}" for m in prev.get("closed", [])]
+        decisions = self.state.get("decisions", {}).get(pr.repo, {})
+        # What was decided for this repository is kept even when the whole pull
+        # request is reviewed again: a fresh read is not a reason to forget it.
+        memory = review.decision_lines(decisions) + ([] if job.full else [
+            f"[{m['status'].upper()}] {m['path'] or '-'} — {m['title']}" for m in prev.get("closed", []) if m["id"] not in decisions])
         DATA.mkdir(parents=True, exist_ok=True)
         (DATA / "work").mkdir(exist_ok=True)
 
@@ -420,6 +427,7 @@ class Plugin:
         if not out.ok:
             return fail(out.error or "the review failed", cost, transient=out.transport)
 
+        out.findings, suppressed = review.apply_decisions(out.findings, decisions)
         notes = [{"id": f.id, "runId": run_id, "repo": pr.repo, "number": pr.number, "sha": pr.head,
                   "severity": f.severity, "title": f.title, "body": f.body,
                   **({"path": f.path} if f.path else {}), **({"line": f.line} if f.line else {})} for f in out.findings]
@@ -428,7 +436,8 @@ class Plugin:
             if not r.get("ok"):
                 log("notes refused", pr.key, r)
         meta = " · ".join(x for x in [f"${cost:.2f}" if out.cost_usd is not None else None, f"{int(out.seconds)} s",
-                                        "since last review" if prev.get("sha") and not job.full else "whole pull request"] if x)
+                                        "since last review" if prev.get("sha") and not job.full else "whole pull request",
+                                        f"{suppressed} dismissed earlier, not raised" if suppressed else None] if x)
         summary = (f"*{out.intent}*\n\n" if out.intent else "") + out.summary
         call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": summary, "meta": meta,
                                                     "finishedAt": int(time.time() * 1000)})
@@ -544,7 +553,32 @@ class Plugin:
                 seen = entry.get("notes", {}).get(ev["id"], {})
                 closed.append({"id": ev["id"], "status": ev["status"], "title": seen.get("title", ev["id"]), "path": seen.get("path")})
             entry["closed"] = closed[-200:]
+            self.remember_decision(ev, entry)
             save_state(self.state)
+
+    def remember_decision(self, ev: dict, entry: dict) -> None:
+        """A dismissal that came with a reason is a decision about the
+        repository, not only about this pull request: the same problem in
+        another pull request is not raised again. Without a reason there is
+        nothing to tell the next review, so it stays about this one."""
+        mine = self.state.get("decisions", {}).get(ev["repo"], {})
+        if ev["status"] != "dismissed":
+            mine.pop(ev["id"], None)
+            return
+        replies = ev.get("replies") or ([ev["reply"]] if ev.get("reply") else [])
+        with_status = [x for x in replies if x.get("withStatus") == "dismissed"]
+        said = (with_status or [x for x in replies if x.get("by") == "user"] or [{}])[-1].get("text", "")
+        reason = " ".join(str(said).split())[:500]
+        if not reason:
+            mine.pop(ev["id"], None)
+            return
+        mine = self.state.setdefault("decisions", {}).setdefault(ev["repo"], {})
+        seen = entry.get("notes", {}).get(ev["id"], {})
+        mine.pop(ev["id"], None)
+        mine[ev["id"]] = {"title": seen.get("title", ev["id"]), "path": seen.get("path"), "status": "dismissed",
+                          "reason": reason, "at": ev.get("at")}
+        while len(mine) > DECISIONS_MAX:
+            mine.pop(next(iter(mine)))
 
     # ----------------------------------------------------------- drawing
 
