@@ -181,7 +181,8 @@ class Plugin:
             self.check_cage()
         # The agents actually on this machine, for the Agent select. Verified
         # ones first; the others say so in their label.
-        opts = [{"value": a.id, "label": a.label if a.verified else f"{a.label} (experimental)"} for a in cage.installed_adapters()]
+        opts = [{"value": a.id, "label": a.label + ("" if a.verified else " (experimental)") + (" — not signed in" if cage.not_signed_in(a) else "")}
+                for a in cage.installed_adapters()]
         call("POST", "/plugin/self/options", {"key": "agent", "options": opts})
         threading.Thread(target=self.publish_repos, daemon=True).start()
 
@@ -348,6 +349,10 @@ class Plugin:
             return fail(f"Not reviewed: the sandbox is not safe on this machine — {self.cage.get('why')}")
         if not adapter or not cage.tools.which(adapter.binary):
             return fail(f"Not reviewed: the agent `{agent_id}` is not installed here.")
+
+        signed_out = cage.not_signed_in(adapter)
+        if signed_out:
+            return fail(f"Not reviewed: {signed_out}")
 
         prev = self.state["reviewed"].get(pr.key, {})
         memory = [] if job.full else [f"[{m['status'].upper()}] {m['path'] or '-'} — {m['title']}" for m in prev.get("closed", [])]
