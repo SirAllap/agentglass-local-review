@@ -124,6 +124,11 @@ def save_state(s: dict) -> None:
     tmp.replace(STATE)
 
 
+def run_identity(agent_id: str, model: str) -> dict:
+    """Agent and model as the app reads them for a published review's header."""
+    return {"agent": agent_id[:40], "model": model[:80]}
+
+
 @dataclass
 class Job:
     pr: github.Pr
@@ -370,7 +375,7 @@ class Plugin:
         model = str(self.s("model", ""))
         cap = float(self.s("maxUsdPerReview", 2))
         run_id = job.run_id
-        run = job.run(state="running", startedAt=int(time.time() * 1000))
+        run = job.run(state="running", startedAt=int(time.time() * 1000), **run_identity(agent_id, model))
         call("POST", "/plugin/self/pr/run", run)
         self.draw()
 
