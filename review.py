@@ -71,6 +71,9 @@ class Outcome:
     input_bytes: int = 0
     """Which extra context went to the model: "card", "CI". Empty by default."""
     used_context: list[str] = field(default_factory=list)
+    """Set when the review stopped before the agent because its estimate is
+    over what the person allows without asking. Nothing was spent."""
+    needs_ok: "Estimate | None" = None
 
 
 def parse_answer(text: str) -> Outcome:
@@ -153,6 +156,35 @@ def estimate(input_bytes: int, past: list[tuple[float, int]], cap: float) -> Est
     mid = max(0.01, rate * input_bytes / 1024)
     high = min(cap, mid * 2)
     return Estimate(low=min(mid * 0.5, high), mid=min(mid, high), high=high, basis=basis)
+
+
+@dataclass
+class NeedsOk:
+    """What a gate returns instead of a reason to stop: wait for the person."""
+    estimate: Estimate
+
+
+# A tenth of the day's budget is what one review may cost before it asks.
+ASK_SHARE = 0.1
+
+
+def ask_threshold(setting, day_cap: float) -> float:
+    """Dollars a review may cost, at the high end of its estimate, before the
+    person is asked. Their own number wins; otherwise a tenth of the day."""
+    try:
+        v = float(setting)
+        if v >= 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return day_cap * ASK_SHARE
+
+
+def must_ask(high: float, threshold: float, via: str) -> bool:
+    """The label and the button are the person saying "review this", so they
+    start unasked while the estimate fits the threshold. A run from any other
+    source (a list of pull requests to always review) always asks."""
+    return via not in ("label", "button") or high > threshold
 
 
 def decision_lines(decisions: dict) -> list[str]:
@@ -268,6 +300,9 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
         if gate is not None:
             # Asked before anything is spent: the reason to stop, or None.
             stop = gate(used)
+            if isinstance(stop, NeedsOk):
+                return Outcome(ok=False, error="waiting for your OK", seconds=time.time() - started,
+                               input_bytes=used, needs_ok=stop.estimate)
             if stop:
                 return Outcome(ok=False, error=stop, seconds=time.time() - started, input_bytes=used)
         c = cage.build(adapter, snap, [ctx_dir], work / "out", work / "agent", prompt, model, cap_usd)
