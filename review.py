@@ -180,7 +180,7 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
             files["memory"].write_text("\n".join(memory), encoding="utf-8")
 
         snap = work / "repo"
-        github.snapshot(pr.repo, pr.head, snap)
+        github.snapshot(pr.repo, pr.head, snap, pr.number)
         # The pull request's own agent configuration (hooks, MCP servers)
         # must not run inside its review. See cage.py.
         cage.sanitize_snapshot(snap)

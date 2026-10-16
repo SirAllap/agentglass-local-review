@@ -19,7 +19,7 @@ Every agent runs in one [bubblewrap](https://github.com/containers/bubblewrap) s
 - The agent gets a throwaway config directory, so none of your hooks, MCP servers or settings run, and nothing it writes outlives the review.
 - One output directory is the only thing it can write.
 
-The plugin reads GitHub outside the sandbox, with your `gh` login, and only reads: the pull request's tarball at its head commit, its diff and its threads. It never checks out anything in your repositories.
+The plugin reads GitHub outside the sandbox, with your `gh` login, and only reads: the pull request's code at its head commit, its diff and its threads. It never checks out anything in your repositories.
 
 The plugin checks the sandbox when it starts and refuses to review if any of that does not hold. Measured with Claude given every permission of its own: it could not write a file, `gh` answered "not logged in", and `git` over SSH failed.
 
@@ -60,8 +60,9 @@ A repository to review must be one of these:
   keyring. Once, in a terminal: `gh auth token | gh auth login -h github.com --with-token --insecure-storage`
   (the token file is readable by you only).
 
-With neither, the review is skipped and says so. The head commit's code is
-always fetched with `gh`.
+With neither, the review is skipped and says so. The head commit's code comes
+from the app's checkout when it has one (and then `gh` is not needed at all);
+only a repository without a checkout is fetched with `gh`.
 
 ## Install
 
