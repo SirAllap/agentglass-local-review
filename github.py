@@ -207,7 +207,11 @@ def viewer() -> str:
     d = app_get("/prs/capability", {}, 20)
     if d and d.get("login"):
         return str(d["login"])
-    return str(gh_json(["api", "user"])["login"])
+    heard = app_said
+    try:
+        return str(gh_json(["api", "user"])["login"])
+    except GhError as e:
+        raise GhError(f"the app said: {heard or 'no login'}; gh said: {e}") from None
 
 
 @dataclass

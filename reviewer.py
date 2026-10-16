@@ -178,6 +178,11 @@ class Plugin:
         self.current_started = 0.0
         self.proc: subprocess.Popen | None = None
         self.me: str | None = None
+        # Why the login is unknown, in words that end with what to do.
+        self.me_error: str | None = None
+        # The last failure to list repositories, so a login that stays broken
+        # is logged once and not on every settings event.
+        self.repos_error: str | None = None
         self.last_scan = 0.0
         self.scanning = threading.Lock()
         self.cage: dict = {"ok": False, "why": "not checked yet", "checks": {}}
@@ -231,6 +236,33 @@ class Plugin:
         call("POST", "/plugin/self/options", {"key": "agent", "options": opts})
         threading.Thread(target=self.publish_repos, daemon=True).start()
 
+    def who_am_i(self) -> str | None:
+        """The person's GitHub login: what they typed, else what the app or
+        `gh` says. None, with `me_error` saying what to do, when nobody knows;
+        the caller must not take that for "not yours"."""
+        typed = str(self.s("githubLogin", "")).strip()
+        if typed:
+            return typed
+        if self.me:
+            return self.me
+        try:
+            me = github.viewer()
+        except github.GhError as e:
+            with self.lock:
+                self.me_error = (f"Cannot tell which pull requests are yours ({e}). "
+                                 "Type your login in this plugin's settings, under Your GitHub login.")[:400]
+            return None
+        with self.lock:
+            self.me, self.me_error = me, None
+        return me
+
+    def is_mine(self, pr: github.Pr) -> bool | None:
+        """True or False, or None while the login is not known."""
+        if not self.s("onlyMine", True):
+            return True
+        me = self.who_am_i()
+        return None if me is None else pr.author == me
+
     def publish_repos(self) -> None:
         """Every repository the person can reach, for the Repositories picker:
         their own, the ones they collaborate on, and their organisations',
@@ -239,8 +271,11 @@ class Plugin:
         try:
             names = github.accessible_repos()
         except github.GhError as e:
-            log("could not list repositories", e)
+            if str(e) != self.repos_error:
+                log("could not list repositories", e)
+            self.repos_error = str(e)
             return
+        self.repos_error = None
         call("POST", "/plugin/self/options", {"key": "repos", "options": names})
 
     def s(self, key: str, default=None):
@@ -353,17 +388,14 @@ class Plugin:
         errors: list[str] = []
         # Each source on its own: one pull request that can no longer be read
         # must not stop every other one from being found.
-        if self.me is None and repos:
-            try:
-                me = github.viewer()
-                with self.lock:
-                    self.me = me
-            except github.GhError as e:
-                errors.append(str(e))
+        if repos and self.s("onlyMine", True) and self.who_am_i() is None and self.me_error:
+            errors.append(self.me_error)
         for repo in repos:
             try:
                 for pr in github.labeled(repo, label):
-                    if self.s("onlyMine", True) and pr.author != self.me:
+                    # Unknown (None) is not "somebody else's": it stays listed,
+                    # and the error above says why it is not reviewed yet.
+                    if self.is_mine(pr) is False:
                         continue
                     found[pr.key] = pr
                     labelled.add(pr.key)
@@ -399,6 +431,8 @@ class Plugin:
             done = self.state["reviewed"].get(pr.key, {})
             if pr.draft and not self.s("reviewDrafts", False):
                 continue
+            if pr.key in labelled and self.is_mine(pr) is None:
+                continue  # whose it is is not known: listed, not reviewed on a guess
             # A head the agent failed on is not retried on its own — at a
             # model's price per attempt that is a bill every few minutes. A new
             # push or a click tries again. One that never reached the agent
