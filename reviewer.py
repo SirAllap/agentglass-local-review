@@ -59,6 +59,16 @@ def call(method: str, path: str, body: object | None = None, timeout: float = 40
         return {"ok": False, "status": 0, "error": str(e)[:200]}
 
 
+def with_github(result: dict, why: str | None) -> dict:
+    """The cage result plus the one check the cage cannot make: that GitHub
+    answers this process. Without it the panel read "Sandbox holds" while
+    every GitHub call failed."""
+    checks = {**(result.get("checks") or {}), "GitHub is reachable from the plugin": why is None}
+    ok = bool(result.get("ok")) and why is None
+    reasons = [x for x in (result.get("why"), why) if x]
+    return {**result, "ok": ok, "checks": checks, "why": None if ok else " · ".join(reasons)}
+
+
 def log(*a: object) -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     with open(DATA / "plugin.log", "a", encoding="utf-8") as f:
@@ -147,7 +157,7 @@ class Plugin:
         and that the agent starts inside. Again whenever the agent changes."""
         agent = str(self.s("agent", "claude"))
         adapter = cage.ADAPTERS.get(agent)
-        result = cage.self_test(BASE, adapter)
+        result = with_github(cage.self_test(BASE, adapter), github.unreachable([r for r in self.s("repos", []) if github.REPO_RE.match(r)]))
         with self.lock:
             self.cage, self.cage_for = result, agent
 
@@ -171,7 +181,8 @@ class Plugin:
             self.check_cage()
         # The agents actually on this machine, for the Agent select. Verified
         # ones first; the others say so in their label.
-        opts = [{"value": a.id, "label": a.label if a.verified else f"{a.label} (experimental)"} for a in cage.installed_adapters()]
+        opts = [{"value": a.id, "label": a.label + ("" if a.verified else " (experimental)") + (" — not signed in" if cage.not_signed_in(a) else "")}
+                for a in cage.installed_adapters()]
         call("POST", "/plugin/self/options", {"key": "agent", "options": opts})
         threading.Thread(target=self.publish_repos, daemon=True).start()
 
@@ -336,8 +347,15 @@ class Plugin:
 
         if not self.cage.get("ok"):
             return fail(f"Not reviewed: the sandbox is not safe on this machine — {self.cage.get('why')}")
-        if not adapter or not shutil.which(adapter.binary):
+        if not adapter or not cage.tools.which(adapter.binary):
             return fail(f"Not reviewed: the agent `{agent_id}` is not installed here.")
+
+        unreadable = github.cannot_read(pr.repo)
+        if unreadable:
+            return fail(f"Not reviewed: {unreadable}")
+        signed_out = cage.not_signed_in(adapter)
+        if signed_out:
+            return fail(f"Not reviewed: {signed_out}")
 
         prev = self.state["reviewed"].get(pr.key, {})
         memory = [] if job.full else [f"[{m['status'].upper()}] {m['path'] or '-'} — {m['title']}" for m in prev.get("closed", [])]
@@ -539,7 +557,7 @@ class Plugin:
                                  "children": [{"type": "list", "items": rows, "empty": empty or "Nothing."}]})
             checks = self.cage.get("checks") or {}
             children.append({"type": "text", "size": "sm", "tone": "muted",
-                             "text": f"Sandbox holds · {sum(1 for v in checks.values() if v)} of {len(checks)} checks · "
+                             "text": f"{'Sandbox holds' if self.cage.get('ok') else 'Check failed: ' + str(self.cage.get('why'))} · {sum(1 for v in checks.values() if v)} of {len(checks)} checks · "
                                      f"watching {len(self.prs)} pull {'request' if len(self.prs) == 1 else 'requests'}"})
             return {"type": "stack", "gap": "lg", "children": children}
 
@@ -566,11 +584,11 @@ class Plugin:
         for h in self.state["history"][:40]:
             seen = self.state["reviewed"].get(h["key"], {}).get("seenAt", 0)
             counts = h.get("counts") or {}
-            worst = counts.get("critical", 0) + counts.get("high", 0)
+            worst = [f"{counts[k]} {k}" for k in ("critical", "high") if counts.get(k)]
             if not h["ok"]:
                 badges = [{"text": "failed", "tone": "danger"}]
             elif worst:
-                badges = [{"text": f"{worst} high", "tone": "danger"}]
+                badges = [{"text": ", ".join(worst), "tone": "danger"}]
             elif any(counts.values()):
                 badges = [{"text": f"{sum(counts.values())} to look at", "tone": "warning"}]
             else:

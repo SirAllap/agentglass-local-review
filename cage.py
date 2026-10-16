@@ -48,6 +48,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import tools
+
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 
 # Hidden from the agent: an empty tmpfs over each directory, /dev/null over
@@ -119,6 +121,12 @@ class Adapter:
     # Variables this agent authenticates with, when a person uses a key
     # rather than a login. Passed through; no other agent's are.
     env_keys: list[str] = field(default_factory=list)
+    # For a CLI that writes under XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME
+    # (logs, a database) and has no variable for its own folder: the name of
+    # its folder under the data home. It gets fresh writable ones, with only
+    # `credentials` of the real folder bound in, so an empty, read-only HOME
+    # is not the reason it cannot start.
+    xdg_app: str | None = None
 
 
 def _claude_argv(prompt: str, model: str, cap_usd: float, dirs: list[str]) -> list[str]:
@@ -205,13 +213,30 @@ ADAPTERS: dict[str, Adapter] = {
     ),
     "opencode": Adapter(
         id="opencode", label="OpenCode", binary="opencode", verified=False,
-        argv=_opencode_argv, config_dirs=[".config/opencode", ".local/share/opencode"], parse=_plain_parse,
+        argv=_opencode_argv, config_dirs=[".config/opencode"], parse=_plain_parse,
+        credentials=["auth.json"], xdg_app="opencode", env_keys=["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
     ),
 }
 
 
 def installed_adapters() -> list[Adapter]:
-    return [a for a in ADAPTERS.values() if shutil.which(a.binary)]
+    return [a for a in ADAPTERS.values() if tools.which(a.binary)]
+
+
+def not_signed_in(adapter: Adapter) -> str | None:
+    """The sentence that says an agent has no login here, or None. Only for a
+    CLI whose login is a file we bind in (its `credentials`): asking a model
+    to review with none costs a failed run and says "401"."""
+    if not adapter.config_env or not adapter.credentials or not adapter.config_dirs:
+        return None
+    if any(os.environ.get(k) for k in adapter.env_keys):
+        return None
+    home = HOME / adapter.config_dirs[0]
+    if any((home / c).is_file() for c in adapter.credentials):
+        return None
+    where = "~/" + adapter.config_dirs[0] + "/" + adapter.credentials[0]
+    keys = " or ".join(adapter.env_keys)
+    return f"{adapter.label} is not signed in on this machine: there is no {where}" + (f" and no {keys}" if keys else "") + f". Sign in once in a terminal with `{adapter.binary} login`."
 
 
 def bwrap_path() -> str | None:
@@ -257,14 +282,11 @@ def runtime_mounts(adapter: Adapter, path: str | None = None) -> list[Path]:
             r = _home_root(Path(entry))
             if r and r.exists():
                 roots.add(r)
-    exe = shutil.which(adapter.binary)
+    exe = tools.which(adapter.binary)
     if exe:
         r = _home_root(Path(exe))
         if r and r.exists():
             roots.add(r)
-    mise = HOME / ".config" / "mise"
-    if mise.is_dir():
-        roots.add(mise.resolve())
     home = HOME.resolve()
     keep = []
     for r in sorted(roots):
@@ -320,6 +342,24 @@ def build(adapter: Adapter, snapshot: Path, extra_ro: list[Path], out_dir: Path,
                 dst.touch()
                 args += ["--bind", str(src), str(dst)]
         env[adapter.config_env] = str(config_dir)
+    elif adapter.xdg_app:
+        xdg = work / "xdg"
+        for sub in ("state", "cache", f"data/{adapter.xdg_app}"):
+            (xdg / sub).mkdir(parents=True, exist_ok=True)
+        args += ["--bind", str(xdg), str(xdg)]
+        real = HOME / ".local" / "share" / adapter.xdg_app
+        for cred in adapter.credentials:
+            if (real / cred).is_file():
+                dst = xdg / "data" / adapter.xdg_app / cred
+                dst.touch()
+                args += ["--bind", str(real / cred), str(dst)]
+        env.update({"XDG_DATA_HOME": str(xdg / "data"), "XDG_STATE_HOME": str(xdg / "state"), "XDG_CACHE_HOME": str(xdg / "cache")})
+        # Its config (providers, models) is read, not written: read-only, as
+        # for every CLI without a variable of its own.
+        for d in adapter.config_dirs:
+            p = HOME / d
+            if p.is_dir():
+                args += ["--ro-bind", str(p), str(p)]
     else:
         # Without a variable to redirect it, the agent's own config is mounted
         # back read-only. Some CLIs refuse to start that way; that is the
@@ -342,6 +382,11 @@ def build(adapter: Adapter, snapshot: Path, extra_ro: list[Path], out_dir: Path,
     for k, v in env.items():
         args += ["--setenv", k, v]
     argv = [a.replace("OUT/", str(out_dir) + "/") for a in adapter.argv(prompt, model, cap_usd, [str(p) for p in extra_ro])]
+    # The real binary (symlinks followed, they are not mounted), by absolute path: the cage's PATH may not hold it, and a
+    # version manager's shim cannot work in an empty HOME.
+    exe = tools.which(adapter.binary)
+    if exe and argv and argv[0] == adapter.binary:
+        argv[0] = str(Path(exe).resolve())
     return Cage(snapshot=snapshot, out_dir=out_dir, config_dir=config_dir, argv=args + argv, env=dict(os.environ))
 
 
@@ -430,8 +475,9 @@ def agent_starts(adapter: Adapter) -> tuple[bool, str]:
     that needs more of HOME than its install fails here, before a review
     spends anything on it."""
     import subprocess
-    if not shutil.which(adapter.binary):
-        return False, f"{adapter.binary} is not installed"
+    found = tools.find(adapter.binary)
+    if not found.path:
+        return False, found.missing(adapter.binary)
     with tempfile.TemporaryDirectory(prefix="agx-cage-agent-") as t:
         snap = Path(t, "snap"); snap.mkdir()
         probe = Adapter(**{**adapter.__dict__, "argv": lambda p, m, c, d: [adapter.binary, "--version"]})

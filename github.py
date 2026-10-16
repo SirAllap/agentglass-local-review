@@ -1,5 +1,12 @@
-"""Everything read from GitHub, read here — outside the cage, with the user's
-own `gh` login, and only ever read.
+"""Everything read from GitHub, read here, and only ever read.
+
+The first way is the app: agentglass talks to GitHub with its own access (a
+login kept in the system keyring included), and its `/prs/*` read routes
+answer for any repository that has a checkout on this machine. The plugin's
+box cannot reach a keyring, so that is the only way a keyring-only login
+works. The second is `gh` in this process, which needs its token in a file.
+What the app does not offer yet (a commit-to-commit diff, the tarball at a
+commit, the list of reachable repositories) is read with `gh` alone.
 
 No local checkout is involved. The pull request's code comes from GitHub's
 tarball of the exact head commit, extracted into a scratch directory; its
@@ -14,11 +21,18 @@ the test suite checks the source for one.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+import tools
 
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 PR_REF_RE = re.compile(r"^\s*([A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})\s*#\s*(\d{1,9})\s*$")
@@ -35,11 +49,19 @@ def parse_pr_ref(text: str) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
+def _gh_path() -> str:
+    """`gh` by where it really is, not by the PATH the app happened to start with."""
+    found = tools.find("gh")
+    if not found.path:
+        raise FileNotFoundError(found.missing("the GitHub CLI (gh)"))
+    return found.path
+
+
 def gh(args: list[str], timeout: int = 60, binary: bool = False) -> str | bytes:
     try:
-        r = subprocess.run(["gh", *args], capture_output=True, timeout=timeout, text=not binary)
+        r = subprocess.run([_gh_path(), *args], capture_output=True, timeout=timeout, text=not binary)
     except FileNotFoundError as e:
-        raise GhError("the GitHub CLI (gh) is not installed") from e
+        raise GhError(str(e) if e.args and "looked" in str(e) else "the GitHub CLI (gh) is not installed") from e
     except subprocess.TimeoutExpired as e:
         raise GhError(f"gh {args[0]} timed out") from e
     if r.returncode != 0:
@@ -56,6 +78,117 @@ def gh_json(args: list[str], timeout: int = 60):
         raise GhError("gh returned something that is not JSON") from e
 
 
+BASE = os.environ.get("AGENTGLASS_URL", "http://127.0.0.1:4000").rstrip("/")
+TOKEN = os.environ.get("AGENTGLASS_READ_TOKEN", "")
+# Why the app could not answer the last time it was asked, in a sentence; the
+# self-test shows it, and a `gh` failure that follows is read with it.
+app_said: str | None = None
+_roots: dict[str, str] = {}
+
+
+def app_get(path: str, params: dict[str, str], timeout: float = 60) -> dict | None:
+    """One GET to the app's own read routes, or None when it cannot answer
+    (no token, an older build without the route, a refusal, not running).
+    Never raises: the caller goes on to `gh`."""
+    global app_said
+    if not TOKEN:
+        app_said = "the plugin was not given a token"
+        return None
+    req = urllib.request.Request(f"{BASE}{path}?{urllib.parse.urlencode(params)}", headers={"Authorization": f"Bearer {TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = str(json.loads(e.read() or b"{}").get("error") or "")
+        except ValueError:
+            msg = ""
+        app_said = f"{path} answered {e.code}" + (f": {msg}" if msg else "")
+        return None
+    except (OSError, ValueError) as e:
+        app_said = f"{path} did not answer ({str(e)[:80]})"
+        return None
+    if not isinstance(d, dict) or d.get("ok") is False:
+        app_said = f"{path}: {str((d or {}).get('error') or 'not ok')[:200]}"
+        return None
+    app_said = None
+    return d
+
+
+def app_root(repo: str) -> str | None:
+    """The checkout of `repo` on this machine, which is what the app's pull
+    request routes are keyed by. None when there is none."""
+    if repo not in _roots:
+        d = app_get("/prs/locate", {"repo": repo}, 20)
+        if not d or not d.get("root"):
+            return None
+        _roots[repo] = str(d["root"])
+    return _roots[repo]
+
+
+def app_detail(repo: str, number: int) -> dict | None:
+    root = app_root(repo)
+    d = app_get("/prs/detail", {"root": root, "number": str(number)}) if root else None
+    return d.get("detail") if d else None
+
+
+def _app_head(det: dict) -> str | None:
+    """The head commit: the last of the pull request's commits, unless the
+    list was cut short, in which case the app does not know it."""
+    commits = det.get("commits") or []
+    if commits and not (det.get("truncated") or {}).get("commits"):
+        oid = str(commits[-1].get("oid") or "")
+        if re.fullmatch(r"[0-9a-f]{40}", oid):
+            return oid
+    return None
+
+
+FIX_LOGIN = "gh auth token | gh auth login -h github.com --with-token --insecure-storage"
+
+
+def unreachable(repos: list[str] | None = None) -> str | None:
+    """None when this process can read GitHub, else the sentence that says why
+    and what to type. The app is asked first, the way the plugin really reads
+    (a pull request of a watched repository, else the login); then `gh` in
+    this process, where a box has no keyring and a login stored there works
+    in a terminal and fails here."""
+    for repo in (repos or [])[:1]:
+        if app_root(repo) and app_get("/prs/list", {"root": _roots[repo], "filter": "all", "state": "open"}, 30):
+            return None
+    if not repos and app_get("/prs/capability", {}, 20):
+        return None
+    heard = app_said
+    try:
+        gh(["api", "user"], timeout=20)
+    except GhError as e:
+        return (f"agentglass could not read GitHub for the plugin ({heard or 'it has no checkout of the watched repository'}) "
+                f"and gh cannot either ({e}). gh keeps its login in the system keyring, which this box cannot reach. "
+                f"Run once in a terminal: {FIX_LOGIN}")
+    return None
+
+
+_gh_ok: tuple[float, str | None] | None = None
+
+
+def cannot_read(repo: str) -> str | None:
+    """None when `repo` can be read, else the sentence that says why not and
+    what to do. Readable means the app has a checkout of it, or `gh` works in
+    this process. `gh` is asked once a minute, not once per pull request."""
+    global _gh_ok
+    if app_root(repo):
+        return None
+    if _gh_ok is None or time.time() - _gh_ok[0] > 60:
+        try:
+            gh(["api", "user"], timeout=20)
+            _gh_ok = (time.time(), None)
+        except GhError as e:
+            _gh_ok = (time.time(), str(e))
+    if _gh_ok[1] is None:
+        return None
+    return (f"agentglass has no checkout of {repo} and gh cannot read it from the plugin ({_gh_ok[1]}). Either open or clone "
+            f"{repo} in agentglass, or give gh a login kept in a file: {FIX_LOGIN}")
+
+
 def accessible_repos(limit: int = 2000) -> list[str]:
     """owner/name of every repository this login can reach, most recently
     pushed first."""
@@ -66,6 +199,9 @@ def accessible_repos(limit: int = 2000) -> list[str]:
 
 
 def viewer() -> str:
+    d = app_get("/prs/capability", {}, 20)
+    if d and d.get("login"):
+        return str(d["login"])
     return str(gh_json(["api", "user"])["login"])
 
 
@@ -94,18 +230,56 @@ def _pr(repo: str, d: dict) -> Pr:
               base_ref=str(d.get("baseRefName") or ""), url=str(d.get("url") or ""), draft=bool(d.get("isDraft")))
 
 
+def _pr_from_detail(repo: str, det: dict) -> Pr | None:
+    head = _app_head(det)
+    if not head:
+        return None
+    return Pr(repo=repo, number=int(det["number"]), title=str(det.get("title") or ""), author=str(det.get("author") or ""),
+              head=head, base_ref=str(det.get("baseRefName") or ""), url=str(det.get("url") or ""), draft=bool(det.get("isDraft")))
+
+
 def labeled(repo: str, label: str) -> list[Pr]:
+    root = app_root(repo)
+    d = app_get("/prs/list", {"root": root, "filter": "all", "state": "open"}) if root else None
+    if d is not None:
+        out = []
+        for row in d.get("prs") or []:
+            if label not in [str(x.get("name") or "") for x in row.get("labels") or []]:
+                continue
+            pr = view(repo, int(row["number"]))
+            out.append(pr)
+        return out[:50]
     rows = gh_json(["pr", "list", "-R", repo, "--state", "open", "--label", label, "--limit", "50", "--json", PR_FIELDS])
     return [_pr(repo, d) for d in rows]
 
 
 def view(repo: str, number: int) -> Pr:
-    return _pr(repo, gh_json(["pr", "view", str(number), "-R", repo, "--json", PR_FIELDS]))
+    det = app_detail(repo, number)
+    pr = _pr_from_detail(repo, det) if det else None
+    return pr or _pr(repo, gh_json(["pr", "view", str(number), "-R", repo, "--json", PR_FIELDS]))
+
+
+def _app_context(det: dict) -> dict:
+    threads = []
+    for t in det.get("threads") or []:
+        c = (t.get("comments") or [{}])[0]
+        state = "RESOLVED" if t.get("isResolved") else "OUTDATED" if t.get("isOutdated") else "OPEN"
+        threads.append(f"[{state}] {t.get('path')}:{t.get('line') or '-'} ({c.get('author') or '?'}): "
+                       + str(c.get("body") or "").replace("\n", " ")[:300])
+    return {
+        "title": det.get("title") or "", "body": det.get("body") or "", "author": det.get("author") or "",
+        "base": det.get("baseRefName") or "", "head": det.get("headRefName") or "",
+        "commits": [str(c.get("message") or "") for c in det.get("commits") or []][-50:],
+        "threads": threads, "threads_ok": not (det.get("truncated") or {}).get("threads"),
+    }
 
 
 def context(repo: str, number: int) -> dict:
     """What a reviewer reads besides the code: what the pull request says it
     does, the commits it is made of, and what reviewers already said."""
+    det = app_detail(repo, number)
+    if det:
+        return _app_context(det)
     d = gh_json(["pr", "view", str(number), "-R", repo, "--json", "title,body,author,commits,labels,baseRefName,headRefName"])
     owner, name = repo.split("/", 1)
     q = """query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){
@@ -133,6 +307,10 @@ def context(repo: str, number: int) -> dict:
 
 
 def diff(repo: str, number: int) -> str:
+    root = app_root(repo)
+    d = app_get("/prs/diff", {"root": root, "number": str(number)}, 120) if root else None
+    if d and isinstance(d.get("text"), str):
+        return d["text"]
     return str(gh(["pr", "diff", str(number), "-R", repo], timeout=120))
 
 
@@ -165,7 +343,7 @@ def snapshot(repo: str, sha: str, dest: Path) -> int:
     tmp = dest.parent / (dest.name + ".tar.gz")
     try:
         with open(tmp, "wb") as f:
-            proc = subprocess.Popen(["gh", "api", f"repos/{repo}/tarball/{sha}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen([_gh_path(), "api", f"repos/{repo}/tarball/{sha}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             total = 0
             assert proc.stdout is not None
             while chunk := proc.stdout.read(1 << 20):
@@ -177,7 +355,7 @@ def snapshot(repo: str, sha: str, dest: Path) -> int:
             if proc.wait(timeout=600) != 0:
                 raise GhError((proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace").strip()[-300:] or "gh could not download the tarball")
     except FileNotFoundError as e:
-        raise GhError("the GitHub CLI (gh) is not installed") from e
+        raise GhError(str(e) if e.args and "looked" in str(e) else "the GitHub CLI (gh) is not installed") from e
     except subprocess.TimeoutExpired as e:
         raise GhError("downloading the tarball timed out") from e
     dest.mkdir(parents=True, exist_ok=True)

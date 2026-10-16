@@ -234,6 +234,17 @@ class PanelRows(unittest.TestCase):
         self.assertEqual([r["id"] for r in earlier], ["acme/billing#17/r2"])
         self.assertEqual(ready[0]["badges"][0]["text"], "2 high")
 
+    def test_the_badge_names_each_severity_it_counts(self):
+        """One critical and one high used to read "2 high": the badge summed
+        the two and kept the weaker word, so the worst finding vanished."""
+        def badge(counts):
+            hist = [{"key": "acme/orbit#42", "title": "Retry", "run": "r1", "sha": "4a89ef5aa", "at": 200,
+                     "ok": True, "error": None, "cost": 0, "counts": counts}]
+            return self.plugin(hist, {}).sections()[1][0]["badges"][0]["text"]
+        self.assertEqual(badge({"critical": 1, "high": 1}), "1 critical, 1 high")
+        self.assertEqual(badge({"critical": 2}), "2 critical")
+        self.assertEqual(badge({"high": 3, "medium": 4}), "3 high")
+
     def test_a_review_running_or_waiting_is_under_now(self):
         import reviewer
         pr = github.Pr(repo="acme/orbit", number=42, title="Retry", author="me",
@@ -356,3 +367,29 @@ class BoxMigration(unittest.TestCase):
         self.assertEqual(box["network"], "internet")
         self.assertNotIn("write", box)
         self.assertIn("~/.config/gh", box["read"])
+
+
+class GithubReachable(unittest.TestCase):
+    """The panel said "Sandbox holds" while every GitHub call failed: the token
+    of a `gh` login lives in the system keyring, and the box has no keyring."""
+
+    def test_a_working_login_is_reachable(self):
+        with unittest.mock.patch("github.gh", return_value='{"login": "orbit"}'):
+            self.assertIsNone(github.unreachable())
+
+    def test_a_missing_login_names_the_exact_fix(self):
+        err = github.GhError("Requires authentication (HTTP 401)")
+        with unittest.mock.patch("github.gh", side_effect=err):
+            why = github.unreachable()
+        self.assertIn("gh auth token | gh auth login -h github.com --with-token --insecure-storage", why)
+        self.assertIn("keyring", why)
+
+    def test_the_cage_result_fails_when_github_is_not_reachable(self):
+        import reviewer
+        base = {"ok": True, "checks": {"x": True}, "why": None}
+        out = reviewer.with_github(base, "gh has no token in the box")
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["checks"]["GitHub is reachable from the plugin"])
+        self.assertIn("gh has no token in the box", out["why"])
+        self.assertTrue(reviewer.with_github(base, None)["checks"]["GitHub is reachable from the plugin"])
+        self.assertTrue(base["ok"])  # the input is not changed
