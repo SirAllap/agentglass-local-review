@@ -80,11 +80,12 @@ class GithubIsReadOnly(unittest.TestCase):
         tree = ast.parse((HERE / "github.py").read_text())
         out = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.List):
+            lists = [a for a in node.args if isinstance(a, ast.List)] if isinstance(node, ast.Call) else []
+            if lists:
                 fn = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
-                elts = node.args[0].elts
+                elts = lists[0].elts
                 consts = [e.value if isinstance(e, ast.Constant) else "<expr>" for e in elts]
-                if fn in ("gh", "gh_json"):
+                if fn in ("run_gh", "read", "read_json"):
                     out.append(consts)
                 elif fn == "Popen" and consts and consts[0] == "gh":
                     out.append(consts[1:])
@@ -374,12 +375,23 @@ class GithubReachable(unittest.TestCase):
     of a `gh` login lives in the system keyring, and the box has no keyring."""
 
     def test_a_working_login_is_reachable(self):
-        with unittest.mock.patch("github.gh", return_value='{"login": "orbit"}'):
+        with unittest.mock.patch("github.proxy_text", return_value=None), \
+                unittest.mock.patch("github.run_gh", return_value='{"login": "orbit"}'):
             self.assertIsNone(github.unreachable())
+
+    def test_agentglass_answering_is_reachable_without_gh(self):
+        with unittest.mock.patch("github.proxy_text", return_value="{}"), \
+                unittest.mock.patch("github.run_gh", side_effect=AssertionError("gh must not run")):
+            self.assertIsNone(github.unreachable())
+
+    def test_agentglass_answering_with_an_error_says_to_log_in_on_the_host(self):
+        with unittest.mock.patch("github.proxy_text", side_effect=github.GhError("Requires authentication (HTTP 401)")):
+            self.assertIn("gh auth login", github.unreachable())
 
     def test_a_missing_login_names_the_exact_fix(self):
         err = github.GhError("Requires authentication (HTTP 401)")
-        with unittest.mock.patch("github.gh", side_effect=err):
+        with unittest.mock.patch("github.proxy_text", return_value=None), \
+                unittest.mock.patch("github.run_gh", side_effect=err):
             why = github.unreachable()
         self.assertIn("gh auth token | gh auth login -h github.com --with-token --insecure-storage", why)
         self.assertIn("keyring", why)
@@ -393,3 +405,55 @@ class GithubReachable(unittest.TestCase):
         self.assertIn("gh has no token in the box", out["why"])
         self.assertTrue(reviewer.with_github(base, None)["checks"]["GitHub is reachable from the plugin"])
         self.assertTrue(base["ok"])  # the input is not changed
+
+
+class ThroughTheServer(unittest.TestCase):
+    """The box has no keyring, so GitHub reads go through agentglass, which
+    holds the login. Without the server route (an older agentglass) the plugin
+    runs `gh` itself, as before."""
+
+    def test_a_read_uses_the_server_answer_and_never_runs_gh(self):
+        out = '[{"number": 7, "title": "Retry", "author": {"login": "me"}, "headRefOid": "a" * 40, "baseRefName": "main", "url": "u", "isDraft": false}]'
+        out = out.replace('"a" * 40', '"' + "a" * 40 + '"')
+        with unittest.mock.patch("github.proxy_text", return_value=out) as px, \
+                unittest.mock.patch("subprocess.run", side_effect=AssertionError("gh must not run")):
+            prs = github.labeled("acme/orbit", "needs review")
+        self.assertEqual(prs[0].number, 7)
+        self.assertEqual(px.call_args.args[0], "pr-list")
+
+    def test_a_server_without_the_route_falls_back_to_gh(self):
+        with unittest.mock.patch("github.proxy_text", return_value=None), \
+                unittest.mock.patch("github.run_gh", return_value='{"login": "orbit"}') as g:
+            self.assertEqual(github.viewer(), "orbit")
+        self.assertEqual(g.call_args.args[0], ["api", "user"])
+
+    def test_a_server_error_is_the_error_and_gh_is_not_tried(self):
+        with unittest.mock.patch("github.proxy_text", side_effect=github.GhError("Requires authentication (HTTP 401)")), \
+                unittest.mock.patch("github.run_gh", side_effect=AssertionError("no fallback after an answer")):
+            with self.assertRaises(github.GhError):
+                github.diff("acme/orbit", 7)
+
+    def test_proxy_reports_absent_for_404_and_for_no_connection(self):
+        import io, urllib.error
+        def raising(code):
+            def f(*a, **k):
+                raise urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b"{}"))
+            return f
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=raising(404)):
+            self.assertIsNone(github.proxy_text("user"))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            self.assertIsNone(github.proxy_text("user"))
+
+    def test_the_request_names_an_operation_and_never_a_command(self):
+        seen = {}
+        class R:
+            def __enter__(s): return s
+            def __exit__(s, *a): pass
+            def read(s): return b'{"ok": true, "stdout": "{}"}'
+        def fake(req, timeout=0):
+            seen["url"] = req.full_url; seen["method"] = req.get_method(); return R()
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=fake):
+            self.assertEqual(github.proxy_text("pr-diff", repo="acme/orbit", number=7), "{}")
+        self.assertEqual(seen["method"], "GET")
+        self.assertIn("/plugin/self/github?", seen["url"])
+        self.assertIn("op=pr-diff", seen["url"])
