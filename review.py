@@ -62,6 +62,10 @@ class Outcome:
     cost_usd: float | None = None
     seconds: float = 0.0
     error: str | None = None
+    """True when the review never reached the agent because GitHub (or the
+    app's copy of it) did not answer. Such a failure says nothing about the
+    pull request, so the plugin tries the same head again."""
+    transport: bool = False
 
 
 def parse_answer(text: str) -> Outcome:
@@ -214,7 +218,7 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
             out.error = f"{adapter.label} exited with {proc.returncode}: {tail[0][:240]}"
         return out
     except github.GhError as e:
-        return Outcome(ok=False, error=str(e), seconds=time.time() - started)
+        return Outcome(ok=False, error=str(e), seconds=time.time() - started, transport=True)
     except Exception as e:  # anything else still ends the run as failed, never as "running"
         return Outcome(ok=False, error=f"the review stopped on an error: {type(e).__name__}: {e}"[:300],
                        seconds=time.time() - started)
