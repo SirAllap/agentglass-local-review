@@ -179,6 +179,9 @@ class Plugin:
         self.cage: dict = {"ok": False, "why": "not checked yet", "checks": {}}
         self.cage_for: str | None = None
         self.notice: str | None = None
+        # False once the app answers 404 to a thread reply: it is older than
+        # contract v2 and the plugin stops trying.
+        self.reply_supported = True
         # A run held in "needs-ok" is kept in state["awaiting"] by run id, so
         # a restart does not strand it. An app that refuses the state (one
         # older than contract v2) is remembered and never asked again.
@@ -523,8 +526,43 @@ class Plugin:
                                                     "finishedAt": int(time.time() * 1000)})
         self.remember(pr, run_id, out, None, cost, agent=agent_id)
         worst = [f for f in out.findings if f.severity in ("critical", "high")]
+        self.answer_threads(pr, {f.id for f in out.findings}, whole=job.full or not prev.get("sha"))
         notify(f"Review ready: {pr.key}",
                f"{len(out.findings)} findings" + (f", {len(worst)} critical or high" if worst else "") + " — open the pull request in agentglass")
+
+    def answer_threads(self, pr: github.Pr, found: set[str], whole: bool) -> None:
+        """After a review: answer each finding whose thread the person wrote in,
+        once, in the thread only. What the person is waiting on is in
+        entry["asked"]; a finding they closed meanwhile is not answered."""
+        with self.lock:
+            entry = self.state["reviewed"].get(pr.key, {})
+            asked = entry.get("asked", {})
+            closed = {c["id"] for c in entry.get("closed", [])}
+            ids = [i for i in asked if i not in closed]
+        for fid in list(asked):
+            if fid in closed:
+                asked.pop(fid, None)
+        for fid in ids:
+            if not self.reply_supported:
+                break
+            now = int(time.time() * 1000)
+            with self.lock:
+                times = [t for t in self.state.get("replyTimes", []) if now - t < 3_600_000]
+            if review.replies_left(times, now) == 0:
+                break
+            r = call("POST", "/plugin/self/pr/notes/reply", {"id": fid, "text": review.thread_answer(fid in found, pr.head, whole)})
+            if r.get("ok"):
+                with self.lock:
+                    self.state["replyTimes"] = times + [now]
+                    asked.pop(fid, None)
+            elif r.get("status") == 429:
+                break
+            elif r.get("status") == 404 and not r.get("error"):
+                self.reply_supported = False
+            else:
+                asked.pop(fid, None)  # a finding the app no longer has: nothing to answer
+        with self.lock:
+            save_state(self.state)
 
     def remember(self, pr: github.Pr, run_id: str, out: review.Outcome | None, error: str | None, cost: float = 0.0,
                  transient: bool = False, agent: str = "") -> None:
@@ -676,6 +714,15 @@ class Plugin:
                 seen = entry.get("notes", {}).get(ev["id"], {})
                 closed.append({"id": ev["id"], "status": ev["status"], "title": seen.get("title", ev["id"]), "path": seen.get("path")})
             entry["closed"] = closed[-200:]
+            # A person's reply on an open finding is a question for the next
+            # review to answer; the plugin's own words are not.
+            asked = entry.setdefault("asked", {})
+            if ev["status"] != "open":
+                asked.pop(ev["id"], None)
+            elif (ev.get("reply") or {}).get("by") == "user":
+                asked[ev["id"]] = ev["reply"].get("at") or 0
+                while len(asked) > 200:
+                    asked.pop(next(iter(asked)))
             self.remember_decision(ev, entry)
             save_state(self.state)
 
