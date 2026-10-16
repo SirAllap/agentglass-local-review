@@ -114,3 +114,36 @@ class AppGet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoCheckoutNoLogin(unittest.TestCase):
+    """A repository the app has no checkout of, read with a gh that keeps its
+    token in a keyring: nothing can read it, and the review says what to do
+    instead of failing on a 401 halfway."""
+
+    def setUp(self):
+        github._roots.clear()
+        github._gh_ok = None
+        self.addCleanup(github._roots.clear)
+
+    def test_a_checkout_in_the_app_is_enough(self):
+        app = routes(**{"/prs/locate": {"ok": True, "root": "/work/orbit"}})
+        with mock.patch("github.app_get", app), mock.patch("github.gh", side_effect=AssertionError("gh called")):
+            self.assertIsNone(github.cannot_read("acme/orbit"))
+
+    def test_no_checkout_and_a_gh_that_works_is_enough(self):
+        with mock.patch("github.app_get", routes()), mock.patch("github.gh", return_value="{}"):
+            self.assertIsNone(github.cannot_read("acme/orbit"))
+
+    def test_neither_says_both_ways_out(self):
+        with mock.patch("github.app_get", routes()), mock.patch("github.gh", side_effect=github.GhError("HTTP 401")):
+            why = github.cannot_read("acme/orbit")
+        self.assertIn("acme/orbit", why)
+        self.assertIn("open or clone", why)
+        self.assertIn(github.FIX_LOGIN, why)
+
+    def test_gh_is_asked_once_not_per_pull_request(self):
+        with mock.patch("github.app_get", routes()), mock.patch("github.gh", side_effect=github.GhError("HTTP 401")) as g:
+            github.cannot_read("acme/orbit")
+            github.cannot_read("acme/orbit")
+        self.assertEqual(g.call_count, 1)

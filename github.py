@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import tarfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -164,6 +165,28 @@ def unreachable(repos: list[str] | None = None) -> str | None:
                 f"and gh cannot either ({e}). gh keeps its login in the system keyring, which this box cannot reach. "
                 f"Run once in a terminal: {FIX_LOGIN}")
     return None
+
+
+_gh_ok: tuple[float, str | None] | None = None
+
+
+def cannot_read(repo: str) -> str | None:
+    """None when `repo` can be read, else the sentence that says why not and
+    what to do. Readable means the app has a checkout of it, or `gh` works in
+    this process. `gh` is asked once a minute, not once per pull request."""
+    global _gh_ok
+    if app_root(repo):
+        return None
+    if _gh_ok is None or time.time() - _gh_ok[0] > 60:
+        try:
+            gh(["api", "user"], timeout=20)
+            _gh_ok = (time.time(), None)
+        except GhError as e:
+            _gh_ok = (time.time(), str(e))
+    if _gh_ok[1] is None:
+        return None
+    return (f"agentglass has no checkout of {repo} and gh cannot read it from the plugin ({_gh_ok[1]}). Either open or clone "
+            f"{repo} in agentglass, or give gh a login kept in a file: {FIX_LOGIN}")
 
 
 def accessible_repos(limit: int = 2000) -> list[str]:

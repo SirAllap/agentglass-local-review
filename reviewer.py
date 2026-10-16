@@ -350,6 +350,9 @@ class Plugin:
         if not adapter or not cage.tools.which(adapter.binary):
             return fail(f"Not reviewed: the agent `{agent_id}` is not installed here.")
 
+        unreadable = github.cannot_read(pr.repo)
+        if unreadable:
+            return fail(f"Not reviewed: {unreadable}")
         signed_out = cage.not_signed_in(adapter)
         if signed_out:
             return fail(f"Not reviewed: {signed_out}")

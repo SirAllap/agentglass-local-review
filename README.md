@@ -50,15 +50,18 @@ back to Balanced and says so rather than reviewing with nothing.
 **Anything to add** is pasted at the end of whichever prompt is in use, for
 the house rule a reviewer keeps forgetting.
 
-## How it reads GitHub
+## What it needs
 
-The plugin asks agentglass first: the app holds the GitHub login, a system
-keyring included, and answers for any repository that has a checkout on this
-machine. When it cannot (no checkout, an older build), the plugin falls back
-to `gh`, and the plugin's box has no keyring, so that login must live in a
-file. Once, in a terminal: `gh auth token | gh auth login -h github.com --with-token --insecure-storage`
-(the token file is readable by you only). The tarball of the head commit and a
-commit-to-commit diff are read with `gh` only.
+A repository to review must be one of these:
+
+- open or cloned in agentglass: the app holds the GitHub login (a keyring
+  included) and the plugin reads the pull request from it; or
+- readable by `gh` with a login kept in a file, since the plugin's box has no
+  keyring. Once, in a terminal: `gh auth token | gh auth login -h github.com --with-token --insecure-storage`
+  (the token file is readable by you only).
+
+With neither, the review is skipped and says so. The head commit's code is
+always fetched with `gh`.
 
 ## Install
 
