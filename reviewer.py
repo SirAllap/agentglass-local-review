@@ -335,11 +335,11 @@ class Plugin:
             return None, spent
         return review.merge_passes([(agent_id, first.findings), (second_id, second.findings)]), spent
 
-    def ask_gate(self, input_bytes: int, agent_id: str, via: str, approved: bool):
+    def ask_gate(self, input_bytes: int, agent_id: str, via: str, approved: bool, focus: bool = False):
         """Asked after the budget gate: wait for the person's OK, or None to
         start. Never twice for the same run, and never on an app that cannot
         hold a run (it would wait for a button that is not drawn)."""
-        if approved or not self.ok_supported:
+        if approved or focus or not self.ok_supported:
             return None
         est = self.estimate_for(input_bytes, agent_id)
         threshold = review.ask_threshold(self.s("askAboveUsd"), float(self.s("maxUsdPerDay", 10)))
@@ -358,15 +358,19 @@ class Plugin:
             return False
         with self.lock:
             self.state["awaiting"][job.run_id] = {"repo": job.pr.repo, "number": job.pr.number, "head": job.pr.head,
-                                                  "full": job.full, "why": job.why, "via": job.via}
+                                                  "full": job.full, "why": job.why, "via": job.via,
+                                                  **({"focus": list(job.focus)} if job.focus else {})}
             save_state(self.state)
         return True
 
     def spent_today(self) -> float:
+        # Asking about one finding draws no run, so the app never sees its
+        # cost; it is kept here and added to whichever count is in use.
+        focus = float((self.state.get("focusSpend") or {}).get(date.today().isoformat(), 0.0))
         app = getattr(self, "app_spend", None)
         if app and app[0] == datetime.now(timezone.utc).date().isoformat():
-            return app[1]
-        return float(self.state["spend"].get(date.today().isoformat(), 0.0))
+            return app[1] + focus
+        return float(self.state["spend"].get(date.today().isoformat(), 0.0)) + focus
 
     # ----------------------------------------------------------- scanning
 
@@ -536,6 +540,14 @@ class Plugin:
                                                  "finishedAt": int(time.time() * 1000)})
 
     def enqueue(self, job: Job) -> None:
+        if job.focus:
+            # A question about one finding: it waits its turn behind a review
+            # but is not one, so it takes nothing back, holds no key and
+            # draws no run on the pull request. The panel's Now list shows it.
+            job.run_id = job.run_id or f"focus-{int(time.time())}"
+            self.queue.put(job)
+            self.draw()
+            return
         with self.lock:
             held = self.waiting_run(job.pr.key)
             if held and not job.approved:
@@ -571,13 +583,15 @@ class Plugin:
         while True:
             job = self.queue.get()
             with self.lock:
-                if job.pr.key in self.dropped:
+                # A focus is not the queued review a cancel was meant for.
+                if job.pr.key in self.dropped and not job.focus:
                     self.dropped.discard(job.pr.key)
                     call("POST", "/plugin/self/pr/run", job.run(
                         state="cancelled", summary="cancelled before it started", finishedAt=int(time.time() * 1000)))
                     self.draw()
                     continue
-                self.queued.discard(job.pr.key)
+                if not job.focus:
+                    self.queued.discard(job.pr.key)
             self.refresh_spend()
             with self.lock:
                 cap_day = float(self.s("maxUsdPerDay", 10))
@@ -585,13 +599,14 @@ class Plugin:
                     self.notice = f"Today's cap of ${cap_day:.2f} is spent — {job.pr.key} waits for tomorrow or a higher cap."
                     # The queued run has to be taken back, or the pull request
                     # keeps saying "Queued" for a review that is not coming.
-                    call("POST", "/plugin/self/pr/run", job.run(
-                        state="cancelled", summary=self.notice, finishedAt=int(time.time() * 1000)))
+                    if not job.focus:
+                        call("POST", "/plugin/self/pr/run", job.run(
+                            state="cancelled", summary=self.notice, finishedAt=int(time.time() * 1000)))
                     self.draw()
                     continue
                 self.current, self.current_started = job, time.time()
             try:
-                self.review(job)
+                self.review_focus(job) if job.focus else self.review(job)
             except Exception:  # a bug in one review must not stop the next
                 log("review crashed", job.pr.key, traceback.format_exc())
             finally:
@@ -647,7 +662,7 @@ class Plugin:
             # refuse when even the low end does not fit in today's budget.
             why = self.budget_gate(n, agent_id)
             if why is None:
-                ask = self.ask_gate(n, agent_id, job.via, job.approved)
+                ask = self.ask_gate(n, agent_id, job.via, job.approved, bool(job.focus))
                 if ask:
                     return ask
                 est = self.estimate_for(n, agent_id)
@@ -664,8 +679,7 @@ class Plugin:
                               context_fn=(lambda p, c: context.gather(p, c.get("head", ""), c.get("body", ""))) if with_context else None,
                               style=str(self.s("style", "balanced")),
                               mine=str(self.s("myPrompt", "")),
-                              extra=review.focus_instruction(job.focus[0], self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(job.focus[1], {}))
-                              if job.focus else str(self.s("extraInstructions", "")))
+                              extra=str(self.s("extraInstructions", "")))
 
         out = run_pass(adapter, model, cap, True)
         if out.needs_ok is not None:
@@ -687,13 +701,6 @@ class Plugin:
         if not out.ok:
             return fail(out.error or "the review failed", cost, transient=out.transport)
 
-        if job.focus:
-            self.finish_focus(pr, job.focus, out)
-            call("POST", "/plugin/self/pr/run", run | {"state": "done", "summary": "Answered in the finding's thread.",
-                                                        **({"meta": f"${cost:.2f}"} if out.cost_usd is not None else {}),
-                                                        "costUsd": round(cost, 4),
-                                                        "finishedAt": int(time.time() * 1000)})
-            return
         merged, extra = self.second_opinion(
             lambda aid, cap2: run_pass(cage.ADAPTERS[aid], model if aid == agent_id else "", cap2, False), agent_id, out)
         if extra:
@@ -879,7 +886,8 @@ class Plugin:
         with self.lock:
             self.prs[pr.key] = pr
         self.enqueue(Job(pr=pr, full=bool(a.get("full")), why=a.get("why", "asked for"), via=a.get("via", "list"),
-                         run_id=str(ev["id"]), approved=True))
+                         run_id=str(ev["id"]), approved=True,
+                         focus=tuple(a["focus"]) if a.get("focus") else None))
 
     def run_skip(self, ev: dict) -> None:
         """The person said no. This head is left alone until a new push or a
@@ -912,6 +920,56 @@ class Plugin:
             self.prs[key] = pr
         self.enqueue(Job(pr=pr, full=True, why="asked for", via="button", focus=(mode, str(ev["noteId"])),
                          title=("Re-check" if mode == "recheck" else "Explain") + f" · {note.get('title', '')[:60]}"))
+
+    def review_focus(self, job: Job) -> None:
+        """Explain or Re-check: one short call about one finding. Whatever
+        happens, the person gets a word in that finding's thread, because there
+        is no run card to carry a failure. The pull request's reviewed head is
+        left alone: this read none of the change but the finding."""
+        pr, (mode, fid) = job.pr, job.focus
+        note = self.state["reviewed"].get(pr.key, {}).get("notes", {}).get(fid, {})
+        agent_id = str(self.s("agent", "claude"))
+        adapter = cage.ADAPTERS.get(agent_id)
+        what = "explain this" if mode == "explain" else "re-check this"
+
+        def say_no(why: str) -> None:
+            self.send_reply(fid, f"Could not {what}: {why}")
+
+        if not self.cage.get("ok"):
+            return say_no(f"the sandbox is not safe on this machine \u2014 {self.cage.get('why')}")
+        if not adapter or not cage.tools.which(adapter.binary):
+            return say_no(f"the agent `{agent_id}` is not installed here.")
+        unreadable = github.cannot_read(pr.repo)
+        if unreadable:
+            return say_no(unreadable)
+        signed_out = cage.not_signed_in(adapter)
+        if signed_out:
+            return say_no(signed_out)
+        DATA.mkdir(parents=True, exist_ok=True)
+        (DATA / "work").mkdir(exist_ok=True)
+
+        def hold(p: subprocess.Popen) -> None:
+            with self.lock:
+                self.proc = p
+
+        def gate(n: int) -> str | None:
+            left = float(self.s("maxUsdPerDay", 10)) - self.spent_today()
+            return f"${max(left, 0):.2f} is left today." if left < review.FOCUS_CAP_USD / 3 else None
+
+        out = review.run(pr, adapter, str(self.s("model", "")), min(float(self.s("maxUsdPerReview", 2)), review.FOCUS_CAP_USD),
+                         None, [], DATA / "work", on_proc=hold, gate=gate, style=str(self.s("style", "balanced")),
+                         mine=str(self.s("myPrompt", "")), extra=review.focus_instruction(mode, note), focused=True)
+        cost = out.cost_usd or 0.0
+        with self.lock:
+            day = date.today().isoformat()
+            spent = self.state.setdefault("focusSpend", {})
+            spent[day] = round(spent.get(day, 0.0) + cost, 4)
+            for old in [d for d in spent if d != day]:
+                spent.pop(old)
+            save_state(self.state)
+        if not out.ok:
+            return say_no(out.error or "the agent failed")
+        self.finish_focus(pr, job.focus, out)
 
     def finish_focus(self, pr: github.Pr, focus: tuple[str, str], out: review.Outcome) -> None:
         mode, fid = focus

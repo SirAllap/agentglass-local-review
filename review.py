@@ -219,6 +219,10 @@ def thread_answer(still_there: bool, sha: str, whole: bool) -> str:
     return head + "the changes since the last review do not raise it again."
 
 
+# A question about one finding reads one file and thinks; it is not a review.
+FOCUS_CAP_USD = 0.3
+
+
 def focus_instruction(mode: str, note: dict) -> str:
     """The one finding a Re-check or an Explain is about, handed to the agent
     in place of the person's usual extra instructions. The finding's own words
@@ -337,7 +341,8 @@ def build_prompt(files: dict[str, Path], incremental: bool, memory: list[str],
 
 def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_sha: str | None,
         memory: list[str], work_root: Path, on_proc=None, timeout_s: int = 1800,
-        style: str = "balanced", mine: str = "", extra: str = "", gate=None, context_fn=None) -> Outcome:
+        style: str = "balanced", mine: str = "", extra: str = "", gate=None, context_fn=None,
+        focused: bool = False) -> Outcome:
     """Gather everything outside the cage, run the agent inside it, read its
     answer. `on_proc` is handed the running process so the plugin can cancel."""
     started = time.time()
@@ -351,15 +356,18 @@ def run(pr: github.Pr, adapter: cage.Adapter, model: str, cap_usd: float, prev_s
             f"# {ctx['title']}\n\nAuthor: {ctx['author']} · {ctx['head']} → {ctx['base']}\n\n"
             f"## Description\n\n{ctx['body'] or '(none)'}\n\n## Commits\n\n" + "\n".join(f"- {c}" for c in ctx["commits"]),
             encoding="utf-8")
-        files["diff"].write_text(github.diff(pr.repo, pr.number), encoding="utf-8")
+        # A question about one finding does not read the whole change: the
+        # agent has the checkout, and the finding says which file to open.
+        files["diff"].write_text("(left out: this is a question about one finding; read the file in the checkout)\n"
+                                 if focused else github.diff(pr.repo, pr.number), encoding="utf-8")
         incremental = False
-        if prev_sha and prev_sha != pr.head:
+        if prev_sha and prev_sha != pr.head and not focused:
             delta = github.compare(pr.repo, prev_sha, pr.head, pr.number)
             if delta is not None:
                 files["delta"] = ctx_dir / "since-last-review.diff"
                 files["delta"].write_text(delta, encoding="utf-8")
                 incremental = True
-        if ctx["threads"]:
+        if ctx["threads"] and not focused:
             files["threads"] = ctx_dir / "review-threads.txt"
             files["threads"].write_text("\n".join(ctx["threads"]), encoding="utf-8")
         used_context: list[str] = []
